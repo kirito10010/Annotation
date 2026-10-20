@@ -1,0 +1,2938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Label Auto 外接看板 —— 本地服务
+运行 `python dashboard.py` 即可。
+零依赖，仅用 Python 标准库。
+"""
+import http.server
+import collections
+import hashlib
+import json
+import os
+import io
+import re
+import shutil
+import time
+import threading
+import webbrowser
+import zipfile
+import urllib.request
+import urllib.parse
+import urllib.error
+import concurrent.futures
+import sys
+import pystray
+from PIL import Image
+
+BASE = "http://172.21.205.141:8771"      # Label Auto 平台地址
+PORT_START = 5221                         # 监听端口
+SORT_CONCURRENCY = 16                     # 查询时并发拉取实时 annotation 的并发上限
+QC_EMAIL = "v_yuronghua@baidu.com"       # 质检平台默认登录账号（owner/admin）
+QC_PASSWORD = "pw123456"
+# 打包成 exe（PyInstaller 冻结）时：静态文件在临时解压目录 _MEIPASS 里。
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
+    STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", HERE), "static")
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    STATIC_DIR = os.path.join(HERE, "static")
+
+# 构建模式：由 PyInstaller runtime hook 注入环境变量区分。
+#   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
+#   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
+RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
+VERSION = "1.0.0"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+# 自更新清单：跟着「最新 Release」的资产走，URL 里不带版本 tag
+# （借鉴 naruto-launcher 的 generic provider：/releases/latest/download/<asset>）。
+# 多个镜像并发探测，谁先回谁参与比较，取版本最高的一份。
+GITHUB_LATEST = "https://github.com/kirito10010/test/releases/latest/download"
+UPDATE_URLS = [
+    "https://gh-proxy.com/" + GITHUB_LATEST + "/version.json",
+    "https://ghfast.top/" + GITHUB_LATEST + "/version.json",
+    "https://ghproxy.net/" + GITHUB_LATEST + "/version.json",
+    "https://raw.githubusercontent.com/kirito10010/test/main/version.json",  # 兜底
+]
+UPDATE_PROBE_TIMEOUT = 5          # 单个清单源超时（秒）
+# 资产下载候选前缀（国内加速镜像优先；直连放最后）
+DOWNLOAD_MIRRORS = [
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "",
+]
+DOWNLOAD_PARTS = 8                # 分段并发数（分段轮流分配到不同镜像）
+DOWNLOAD_RANGE_MIN = 4 * 1024 * 1024   # 小于 4MB 不值得分段
+DOWNLOAD_PROBE_BYTES = 256 * 1024      # 测速用的首段字节数
+
+# ---------- 会话状态 ----------
+TOKEN = None
+USER = None
+_CACHE = {}   # key -> (expire_ts, data)
+_CACHE_ORDER = collections.OrderedDict()   # key -> 最近使用顺序（LRU 淘汰用）
+_CACHE_MAX = 200                           # 条数上限；超出淘汰最久未用的
+
+# 查询进度（供前端轮询显示）
+_PROGRESS = {"phase": "", "total": 0, "done": 0}
+
+# 最近提交记录（仅内存，不落盘；供「最近提交」页与快照滞后纠正用）
+_RECENT_GROUPS = []
+
+# 保存标注后，该图在平台侧会被重置为 pending，但 /images 快照有滞后；
+# 记录 pid -> set(image_id)，用于在 counts/assigned 里把它当 pending 纠正。
+_SAVE_PENDING = {}
+
+# 质检员/作业员登录凭据（用于以其本人 token 提交 /qc，使平台按 token 正确归属质检结果；
+# 也用于局域网访问时按「是否有内置账号」决定是否弹登录框）。
+# 发布版（release）清空：只留于荣华一个内置管理员（QC_EMAIL/QC_PASSWORD），供「改属性」等用其权限。
+_QC_LOGIN = {} if RELEASE_MODE else {
+    # 质检员
+    "68f4d0965cb3": {"email": "v_lijin10@baidu.com", "password": "pw123456"},              # 李劲
+    "d82165faee87": {"email": "v_liqingguang01@baidu.com", "password": "pw123456"},        # 李庆广
+    "5ae7790e0793": {"email": "v_zhanghongchao01@baidu.com", "password": "huiyi4956.."},   # 张洪超（超子）
+    "6d3ed4e0042c": {"email": "v_wangzhe23@baidu.com", "password": "569127"},              # 王哲
+    # 作业员
+    "373ef86dae05": {"email": "v_guoyanan@baidu.com", "password": "123456"},               # 郭雅楠
+    "7d716942e23d": {"email": "v_limin30@baidu.com", "password": "pw123456"},              # 李敏
+    "5e6a072c2a0c": {"email": "v_liyaping05@baidu.com", "password": "123456"},             # 李亚萍（呆柠）
+    "78ca63ae51b1": {"email": "v_lvyixin@baidu.com", "password": "123456"},                # 吕一鑫
+    "e77b61dfe6b3": {"email": "v_haotiantian01@baidu.com", "password": "123456"},          # 郝田田
+    "f0619e1562e9": {"email": "v_niqingge@baidu.com", "password": "pw123456"},             # 倪庆阁
+}
+_QC_TOKENS = {}   # uid -> token（登录后缓存）
+# 发布版登录成功后记住凭据（仅内存）：token 过期时用它自动重登，
+# 不必让用户退出再登录。进程退出即消失，不落盘。
+_USER_CREDENTIALS = {}   # uid -> {"email": str, "password": str}
+
+
+def _get_qc_token(uid):
+    """返回该质检员自己的 token；未配置或登录失败返回 None（调用方回退 owner token）"""
+    if not uid:
+        return None
+    if uid in _QC_TOKENS:
+        return _QC_TOKENS[uid]
+    # 开发版用内置凭据；发布版用登录时记住的凭据（token 过期自愈靠它）
+    cfg = _QC_LOGIN.get(uid) or _USER_CREDENTIALS.get(uid)
+    if not cfg:
+        return None
+    s, h, raw = upstream("POST", "/api/login",
+                         body={"email": cfg["email"], "password": cfg["password"]})
+    if s == 200:
+        try:
+            d = json.loads(raw.decode("utf-8"))
+            tok = d.get("token")
+            if tok:
+                _QC_TOKENS[uid] = tok
+                return tok
+        except Exception:
+            pass
+    return None
+
+
+def _acting_token(uid):
+    """取「当前页面正在以谁的身份看数据」的 token。
+
+    图片/标注转发以前用全局 TOKEN（= 最后登录的那个账号），管理员版里它可能
+    根本不是当前选中的质检员/作业员，平台就会以「该图片未分配给你」403 拒绝。
+    优先用请求带上的 uid；拿不到就返回 None，由 upstream() 回退到全局 TOKEN。
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return None
+    return _get_qc_token(uid)
+
+
+def _current_uid():
+    """当前登录用户 uid（发布版登录自己账号后，由请求头写入 USER）"""
+    return (USER or {}).get("id") or ""
+
+
+# ======================================================================
+# 转发 Label Auto API
+# ======================================================================
+# 限制对上游的并发请求数，避免多人同时使用时把原平台拖慢
+_UPSTREAM_SEM = threading.Semaphore(8)
+# 批量拉取（逐张 annotation 这类扇出）单独再限一道：最多占 _UPSTREAM_SEM 的一半，
+# 保证交互请求（图片转发 / 提交 / 列表）永远有槽可用。
+# 策略只在这里表达一次——调用方只需在批量扇出时传 bulk=True，不必各自记得降并发。
+BULK_UPSTREAM_MAX = 4
+_BULK_SEM = threading.Semaphore(BULK_UPSTREAM_MAX)
+
+
+def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=None, token=None,
+             _retry=True, bulk=False):
+    """把请求转发到 Label Auto，自动附带 Bearer token。返回 (status, headers, bytes)
+
+    token 参数可指定用某个用户的 token（如质检员本人），缺省用全局 owner TOKEN。
+    bulk=True 表示「这是批量扇出里的一次」（逐张拉 annotation），会额外抢 _BULK_SEM：
+    最多占掉一半全局并发槽，剩下的一半留给交互请求，避免批量把「下一张图 / 下一次提交」堵住。
+    """
+    global _OWNER_TOKEN
+    url = BASE + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = {}
+    tok = token or TOKEN
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+    if extra_headers:
+        headers.update(extra_headers)
+    data = raw_body
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    # 锁顺序固定：批量先 _BULK_SEM 再 _UPSTREAM_SEM，交互只取 _UPSTREAM_SEM。
+    # 交互不碰 _BULK_SEM，所以不存在环、不会死锁。
+    if bulk:
+        _BULK_SEM.acquire()
+    try:
+        with _UPSTREAM_SEM:
+            try:
+                resp = urllib.request.urlopen(req, timeout=180)
+                status, h, raw = resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as e:
+                status, h, raw = e.code, dict(e.headers), e.read()
+            except Exception as e:
+                return 502, {}, json.dumps(
+                    {"ok": False, "error": "无法连接平台 %s：%s" % (BASE, e)},
+                    ensure_ascii=False).encode("utf-8")
+    finally:
+        # 必须在 401 自愈重试之前释放：递归重试会再抢一次 _BULK_SEM，
+        # 而 Semaphore 不可重入，外层还握着就会自己死锁。
+        if bulk:
+            _BULK_SEM.release()
+    # token 过期自愈：清掉缓存凭据并重新登录，再重试一次，避免整站持续 401（只能重启服务）
+    if status == 401 and tok and _retry:
+        new_tok = None
+        if tok == _OWNER_TOKEN:
+            with _OWNER_TOKEN_LOCK:
+                _OWNER_TOKEN = None
+            new_tok = _get_owner_token()
+        else:
+            uids = [u for u, t in list(_QC_TOKENS.items()) if t == tok]
+            for u in uids:
+                _QC_TOKENS.pop(u, None)
+            if uids:
+                new_tok = _get_qc_token(uids[0])
+        if new_tok and new_tok != tok:
+            return upstream(method, path, query=query, body=body, raw_body=raw_body,
+                            extra_headers=extra_headers, token=new_tok, _retry=False, bulk=bulk)
+    return status, h, raw
+
+
+def json_bytes(obj):
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+# ---------- 缓存 ----------
+def _cache_drop(key):
+    _CACHE.pop(key, None)
+    _CACHE_ORDER.pop(key, None)
+
+
+def clear_cache_all():
+    _CACHE.clear()
+    _CACHE_ORDER.clear()
+
+
+def cache_get(key, ttl=60):
+    ent = _CACHE.get(key)
+    if ent is None:
+        _CACHE_ORDER.pop(key, None)   # 可能被 _clear_cache_keep_stable 清掉了，顺手对齐
+        return None
+    exp, data = ent
+    if time.time() < exp:
+        _CACHE_ORDER[key] = True
+        _CACHE_ORDER.move_to_end(key)
+        return data
+    _cache_drop(key)   # 过期即删，不再留着占内存（以前只返回 None，条目会一直堆着）
+    return None
+
+
+def cache_set(key, data, ttl=60):
+    _CACHE[key] = (time.time() + ttl, data)
+    _CACHE_ORDER[key] = True
+    _CACHE_ORDER.move_to_end(key)
+    while len(_CACHE_ORDER) > _CACHE_MAX:      # LRU：淘汰最久未用的
+        old, _ = _CACHE_ORDER.popitem(last=False)
+        _CACHE.pop(old, None)
+
+
+def _clear_cache_keep_stable():
+    """写操作后清缓存，但保留 images_* 与 projects。
+
+    状态纠正在 qc_counts/qc_assigned 里由 _SAVE_PENDING + _recent_verdict_overrides
+    完成，无需重拉全量 /images；若连 images 缓存也清掉，提交/保存后刷新会因
+    重新拉全量图片列表而明显变慢。
+
+    也**不清** overrides 复核缓存：调用方用 note_overrides / note_overrides_saved
+    就地改那一条，否则下一次列表请求会对上百张本地纠正做全量 /annotation 复核，
+    把并发的「下一张图 / 下一次提交」堵上 2~3 秒。
+    """
+    for k in list(_CACHE.keys()):
+        if not k.startswith("images_") and k != "projects":
+            _cache_drop(k)
+
+
+# ======================================================================
+# 数据获取
+# ======================================================================
+# 拉取项目列表的并发保护：上游这个接口是**最重的一个**（实测 4.5~7 秒），
+# 以前没有去重，N 个并发请求就各拉一次、互相挤满 _UPSTREAM_SEM，
+# 把单个请求从 5 秒放大到 16~20 秒（「列表偶发等十几秒」的根因）。
+_PROJECTS_LOCK = threading.Lock()          # 保护「拉取」本身：并发时只让一个真的去打上游
+_PROJECTS_FLAG_LOCK = threading.Lock()     # 只保护下面这个标记，**绝不阻塞请求路径**
+_PROJECTS_REFRESHING = False
+
+
+def _fetch_projects():
+    """同步拉一次 /api/projects 并写缓存。
+
+    上游最重的接口（实测 4.5~7s），**调用方必须持有 _PROJECTS_LOCK**，
+    否则并发请求会各拉一次。
+    """
+    status, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
+    if status != 200:
+        raise RuntimeError("拉取项目列表失败 HTTP %s" % status)
+    data = json.loads(raw.decode("utf-8"))
+    cache_set("projects", data, ttl=PROJECTS_TTL)
+    return data
+
+
+def _refresh_projects_async():
+    """过期时后台刷新项目列表，不阻塞请求；同时只允许一个在飞。
+
+    注意这里**只能碰 _PROJECTS_FLAG_LOCK**（毫秒级），绝不能去拿 _PROJECTS_LOCK ——
+    那个锁会被正在拉上游的线程持有 5~7 秒，一旦在这里等它，过期路径就退化成同步阻塞，
+    「先用旧值」的意义就没了；而且等锁期间标记已被清掉，还会再起一个线程重复拉一次。
+    """
+    global _PROJECTS_REFRESHING
+    with _PROJECTS_FLAG_LOCK:
+        if _PROJECTS_REFRESHING:
+            return
+        _PROJECTS_REFRESHING = True
+
+    def _run():
+        global _PROJECTS_REFRESHING
+        try:
+            with _PROJECTS_LOCK:
+                _fetch_projects()
+        except Exception:
+            pass
+        finally:
+            with _PROJECTS_FLAG_LOCK:
+                _PROJECTS_REFRESHING = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def get_projects(force=False):
+    """项目列表（重接口）。
+
+    缓存 PROJECTS_TTL（默认 300s）——它不再负责"新鲜度"：monitoring 探针一旦发现
+    结构变化（新建项目/加图片/换质检员），get_projects_for_ui() 会立刻强拉一次。
+
+    过期**不再同步阻塞**：先用旧值（stale-while-revalidate，与 get_images 同一套写法），
+    后台单飞刷新。只有「完全没有缓存」或 force=True 才会真的去打上游，
+    而且那时也会持 _PROJECTS_LOCK —— 并发请求里只有一个去拉，其余等它写好缓存后直接命中。
+    """
+    if not force:
+        ent = _CACHE.get("projects")
+        if ent is not None:
+            if time.time() < ent[0]:
+                return ent[1]
+            _refresh_projects_async()   # 过期：先返回旧值，后台刷新
+            return ent[1]
+    with _PROJECTS_LOCK:
+        if not force:                   # 等锁期间别人可能已经拉好了
+            ent = _CACHE.get("projects")
+            if ent is not None and time.time() < ent[0]:
+                return ent[1]
+        return _fetch_projects()
+
+
+def get_project(pid):
+    proj = get_projects()
+    for p in proj.get("projects", []):
+        if p.get("id") == pid:
+            return p
+    # 缓存里没有（可能是刚新建的项目，快照滞后）→ 强制刷新一次再找
+    proj = get_projects(force=True)
+    for p in proj.get("projects", []):
+        if p.get("id") == pid:
+            return p
+    return None
+
+
+def get_export_labels(pid, force=False):
+    """全量导出（zip 内一个 labels json），默认缓存 30 分钟；force=True 时强制拉最新"""
+    data = None if force else cache_get("export_" + pid, ttl=1800)
+    if data is None:
+        status, h, raw = upstream("GET", "/api/projects/%s/export" % pid,
+                                  query={"format": "json"}, token=_get_owner_token())
+        if status != 200:
+            raise RuntimeError("导出失败 HTTP %s：%s" % (status, raw[:200].decode('utf-8', 'ignore')))
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        name = zf.namelist()[0]
+        data = json.loads(zf.read(name).decode("utf-8"))
+        cache_set("export_" + pid, data, ttl=1800)
+    return data
+
+
+_IMAGES_LOCK = threading.Lock()
+_IMAGES_REFRESHING = set()   # 正在后台刷新的 pid，避免重复刷新
+
+# /images 快照的新鲜度。和 MONITORING_TTL(10s) / PROJECTS_TTL(300s) 是同一套缓存思路：
+# 这个接口很重（实测 6514 张 ≈ 921KB / 307ms），所以不能把 TTL 调小硬刷；
+# 改成用轻探针 monitoring（52KB / 124ms，已缓存 10s）里的标注/质检进度当「有变化」的信号，
+# 进度一变就在后台提前重拉一次 —— 忙时更新快（≤12s），闲时一次都不多拉。
+IMAGES_TTL = 180             # 兜底：没有任何信号时，多久重拉一次快照
+IMAGES_PROBE_MIN_GAP = 12    # 探针判定「有变化」时，两次重拉之间至少隔这么久（秒）
+
+_IMAGES_PROGRESS = {}        # pid -> 上次判定时 monitoring 里的 (total_annotated, qc_passed, qc_rejected)
+_IMAGES_LAST_TRIGGER = {}    # pid -> 上次因探针触发重拉的时间
+_IMAGES_PROGRESS_LOCK = threading.Lock()
+
+
+def _project_progress(pid):
+    """从轻探针 monitoring 里取该项目的标注/质检进度；拿不到返回 None。
+
+    monitoring 已被 get_monitoring() 缓存 MONITORING_TTL(10s)，这里只是读缓存，几乎不花钱。
+    这三个数（标注完成数 / 质检通过数 / 质检打回数）一变，就说明 /images 快照已经旧了。
+    """
+    try:
+        data = get_monitoring()
+    except Exception:
+        return None                  # 探针坏了 → 退回原来的 TTL 行为，不引入新的失败模式
+    for p in (data.get("projects") or []):
+        if isinstance(p, dict) and p.get("id") == pid:
+            return (p.get("total_annotated") or 0,
+                    p.get("total_qc_passed") or 0,
+                    p.get("total_qc_rejected") or 0)
+    return None                      # 该项目不在探针里（刚新建）→ 不干预
+
+
+def _images_progress_changed(pid):
+    """探针里的作业进度变了 → 当前 /images 快照已经不是最新的。
+
+    只当「该重拉了」的信号：判定为真时**立刻返回**，真正的重拉由调用方交给
+    _refresh_images_async 在后台做（前台永远拿到旧数据、永不阻塞）。
+    """
+    prog = _project_progress(pid)
+    if prog is None:
+        return False
+    with _IMAGES_PROGRESS_LOCK:
+        old = _IMAGES_PROGRESS.get(pid)
+        if old is None:
+            _IMAGES_PROGRESS[pid] = prog     # 首次见到：只记基线，别在启动瞬间触发风暴
+            return False
+        if prog == old:
+            return False
+        now = time.time()
+        if now - _IMAGES_LAST_TRIGGER.get(pid, 0.0) < IMAGES_PROBE_MIN_GAP:
+            return False                     # 节流：最多每 IMAGES_PROBE_MIN_GAP 秒触发一次
+        _IMAGES_PROGRESS[pid] = prog         # 记下新基线
+        _IMAGES_LAST_TRIGGER[pid] = now
+        return True
+
+
+def get_images(pid):
+    """图片列表（滞后快照）。stale-while-revalidate：
+    缓存过期也先返回旧数据，同时后台异步刷新，前台永不阻塞；
+    只有冷启动（完全无缓存）时才同步拉取一次。
+
+    除了满 IMAGES_TTL，**探针发现作业进度变了也会提前在后台重拉一次**
+    （见 _images_progress_changed）—— 否则作业员刚提交的图要等最多 180 秒才会
+    在质检/作业列表里出现，用户看到的就是「作业中几千张、却一直没数据」。
+    判定为真时同样只触发后台刷新，这次请求照旧返回旧快照。
+    """
+    key = "images_" + pid
+    ent = _CACHE.get(key)
+    if ent is not None:
+        expire_ts, data = ent
+        if time.time() >= expire_ts or _images_progress_changed(pid):
+            _refresh_images_async(pid)
+        return data
+    return _fetch_images_sync(pid)
+
+
+def _fetch_images_sync(pid, force=False):
+    key = "images_" + pid
+    with _IMAGES_LOCK:
+        if not force:                       # force=True 时跳过缓存，强制重拉最新快照
+            ent = _CACHE.get(key)
+            if ent is not None:
+                return ent[1]
+        status, h, raw = upstream("GET", "/api/projects/%s/images" % pid,
+                                  token=_get_owner_token())
+        if status != 200:
+            # 拉取失败（token 失效/上游异常）时绝不缓存坏数据，否则会把列表/打回全部清空
+            raise RuntimeError("拉取图片列表失败 HTTP %s" % status)
+        data = json.loads(raw.decode("utf-8"))
+        cache_set(key, data, ttl=IMAGES_TTL)
+        return data
+
+
+def _refresh_images_async(pid):
+    """后台刷新图片列表缓存，不阻塞前台请求。"""
+    with _IMAGES_LOCK:
+        if pid in _IMAGES_REFRESHING:
+            return
+        _IMAGES_REFRESHING.add(pid)
+
+    def _run():
+        try:
+            status, h, raw = upstream("GET", "/api/projects/%s/images" % pid,
+                                      token=_get_owner_token())
+            if status == 200:
+                data = json.loads(raw.decode("utf-8"))
+                cache_set("images_" + pid, data, ttl=IMAGES_TTL)
+        except Exception:
+            pass
+        finally:
+            with _IMAGES_LOCK:
+                _IMAGES_REFRESHING.discard(pid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _force_refresh(pid):
+    """「刷新」时使用：同步重拉 /images 快照，并清掉该项目的 annotation/override 短缓存。
+
+    否则 F5 只会重发同样的请求、命中同样的内存缓存（180s/30s/15s），看起来「刷新没用」。
+    """
+    try:
+        _fetch_images_sync(pid, force=True)
+    except Exception:
+        pass   # 上游异常时退回旧缓存，不阻塞页面
+    clear_overrides_cache()
+    _annotation_cache_clear_pid(pid)
+
+
+
+# 图片缓存：图片内容不可变（上游带 Cache-Control: immutable），缓存可大幅减少对上游的
+# 重复请求，多人同时使用时尤其重要。用 OrderedDict 做简单的 LRU 淘汰。
+_IMAGE_CACHE = collections.OrderedDict()   # pid/image_id -> (expire_ts, content_type, bytes)
+# 上限要够大：前端会预取「下一张」，被挤掉就意味着真正显示时还得回源一次
+# （单张约 300KB，300 条约 90MB 上限，可接受）。
+_IMAGE_CACHE_MAX = 300
+_IMAGE_CACHE_LOCK = threading.Lock()
+
+# 同一张图并发请求时只拉一次上游（预加载与实际展示可能同时请求同一张图）
+_IMAGE_INFLIGHT = {}
+_IMAGE_INFLIGHT_LOCK = threading.Lock()
+
+
+def _image_cache_get(pid, image_id):
+    key = pid + "/" + image_id
+    with _IMAGE_CACHE_LOCK:
+        ent = _IMAGE_CACHE.get(key)
+        if ent and time.time() < ent[0]:
+            _IMAGE_CACHE.move_to_end(key)
+            return ent[1], ent[2]
+        if ent:
+            _IMAGE_CACHE.pop(key, None)
+        return None
+
+
+def _image_cache_put(pid, image_id, content_type, body):
+    key = pid + "/" + image_id
+    with _IMAGE_CACHE_LOCK:
+        _IMAGE_CACHE[key] = (time.time() + 3600, content_type, body)
+        _IMAGE_CACHE.move_to_end(key)
+        while len(_IMAGE_CACHE) > _IMAGE_CACHE_MAX:
+            _IMAGE_CACHE.popitem(last=False)
+
+
+_OWNER_TOKEN = None
+_OWNER_TOKEN_LOCK = threading.Lock()
+
+
+def _get_owner_token():
+    """登录 owner（于荣华）并缓存 token；用于拉取 admin 接口（名字映射等）"""
+    global _OWNER_TOKEN
+    if _OWNER_TOKEN:
+        return _OWNER_TOKEN
+    with _OWNER_TOKEN_LOCK:
+        if _OWNER_TOKEN:
+            return _OWNER_TOKEN
+        s, h, raw = upstream("POST", "/api/login",
+                             body={"email": QC_EMAIL, "password": QC_PASSWORD})
+        if s == 200:
+            try:
+                d = json.loads(raw.decode("utf-8"))
+                _OWNER_TOKEN = d.get("token")
+                return _OWNER_TOKEN
+            except Exception:
+                pass
+    return None
+
+
+# ---------- 项目活跃度过滤 ----------
+# 两个接口的"重量"差很多，缓存策略也分开：
+#   monitoring（轻，约 39KB）：当"变更探针"，拉得勤 → 新项目/结构变化能被及时看到
+#   projects  （重，含每个项目全部 assignments/qc_assignments，项目多时 MB 级）：只管"少拉几次"
+# 两者配合：探针发现结构签名变了 → 立刻强拉一次 projects，所以 projects 的 TTL 可以放长。
+MONITORING_TTL = 10      # 秒：探针的缓存时长（也是强拉 projects 的节流窗口）
+PROJECTS_TTL = 300       # 秒：重接口的缓存时长（结构变化时会提前刷，不必为新鲜度设短）
+PROJECTS_FORCE_MAX_TRIES = 3   # 同一处不一致最多强拉几次（上游迟迟不同步就放弃，等 TTL）
+
+# 不给前端"全部项目"：项目多了拉取/解析都慢。规则（与使用者确认）：
+#   一周内创建的                         → 保留（不论质检是否完成）
+#   一周~一个月之间，质检还没做完         → 保留
+#   一周~一个月之间，质检已 100%          → 不要
+#   超过一个月                            → 一律不要
+PROJECT_KEEP_DAYS = 7     # 一周
+PROJECT_MAX_DAYS = 30     # 一个月
+
+
+def _parse_created_at(s):
+    """平台的 created_at 形如 '2026-09-20 15:29:08'；解析失败返回 None"""
+    try:
+        return time.mktime(time.strptime((s or "").strip()[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _project_sort_key(p):
+    """按创建时间排序用的 key；解析失败取 0，让这类项目排到最后"""
+    return _parse_created_at((p or {}).get("created_at")) or 0
+
+
+def _sort_projects_desc(projects):
+    """按创建时间倒序（新项目在前）。sorted 稳定，时间相同的保持原有相对顺序。"""
+    return sorted(projects, key=_project_sort_key, reverse=True)
+
+
+def keep_project(proj, now=None):
+    """该项目是否保留（见上方规则）。拿不到创建时间就保留，不靠猜测隐藏项目。"""
+    ts = _parse_created_at((proj or {}).get("created_at"))
+    if ts is None:
+        return True
+    age_days = ((now or time.time()) - ts) / 86400.0
+    if age_days > PROJECT_MAX_DAYS:
+        return False
+    if age_days <= PROJECT_KEEP_DAYS:
+        return True
+    # 必须用原始浮点比较：实测 qc_progress=99.99057 会显示成 100.0%，但它并未做完
+    return float(proj.get("qc_progress") or 0) < 100.0
+
+
+def get_monitoring(force=False):
+    """各项目统计（质检看板）。原始数据缓存 MONITORING_TTL，读取时才按 keep_project 过滤，
+    这样时间窗随时间自然移动，不需要重启进程。"""
+    data = None if force else cache_get("monitoring", ttl=MONITORING_TTL)
+    if data is None:
+        status, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
+        if status != 200:
+            raise RuntimeError("拉取项目统计失败 HTTP %s" % status)
+        data = json.loads(raw.decode("utf-8"))
+        cache_set("monitoring", data, ttl=MONITORING_TTL)
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        return data
+    out = dict(data)
+    out["projects"] = [p for p in data["projects"] if keep_project(p)]
+    return out
+
+
+def _active_project_ids():
+    """活跃项目 id 白名单。拿不到统计时返回 None（调用方视为"不过滤"，宁多不少）。"""
+    try:
+        data = get_monitoring()
+    except Exception:
+        return None
+    return {p.get("id") for p in (data.get("projects") or []) if p.get("id")}
+
+
+def _monitoring_signature(data):
+    """从 monitoring 抽「结构签名」——只包含会改变"下拉能选到什么"的结构性信息：
+
+      项目 id 集合                  → 新建/删除项目
+      total_images                 → 项目里新增了图片（通常连带改 qc_assignments）
+      qc_assignees / assignees uid  → 质检员 / 作业员被加进或移出项目
+
+    **故意不含** progress / total_annotated / qc_progress：它们随标注实时变化，
+    纳入就会导致每次探针都"发现变化"→ 持续强拉上游。
+    """
+    if not isinstance(data, dict):
+        return None
+    sig = []
+    for p in (data.get("projects") or []):
+        if not isinstance(p, dict) or not p.get("id"):
+            continue
+        qcs = tuple(sorted((a or {}).get("uid") or "" for a in (p.get("qc_assignees") or [])
+                           if isinstance(a, dict)))
+        anns = tuple(sorted((a or {}).get("uid") or "" for a in (p.get("assignees") or [])
+                            if isinstance(a, dict)))
+        sig.append((p["id"], p.get("total_images") or 0, qcs, anns))
+    return tuple(sorted(sig))
+
+
+_PROJECTS_SIG = None        # projects 缓存当前满足的 monitoring 结构签名
+_PROJECTS_TRY_SIG = None    # 最近一次尝试强拉时对应的签名（用于重置重试计数）
+_PROJECTS_FORCE_TS = 0.0    # 上次强拉时间（节流）
+_PROJECTS_FORCE_TRIES = 0   # 当前这处不一致已强拉几次
+
+
+def get_projects_for_ui():
+    """给下拉/看板用的项目列表：平时命中 PROJECTS_TTL 缓存（重接口少拉几次）；
+    一旦 monitoring 的结构签名与缓存时不一致，就立刻强拉一次 —— 这样后台新建项目、
+    给项目加图片、换质检员这些变化都不必等满 PROJECTS_TTL。
+    """
+    global _PROJECTS_SIG, _PROJECTS_TRY_SIG, _PROJECTS_FORCE_TS, _PROJECTS_FORCE_TRIES
+    data = get_projects()
+    try:
+        sig = _monitoring_signature(get_monitoring())
+    except Exception:
+        return data                      # 探针拿不到 → 不干预，沿用缓存
+    if sig is None:
+        return data
+    if _PROJECTS_SIG is None:            # 首次：只记录基线，不强拉
+        _PROJECTS_SIG = sig
+        return data
+    if sig == _PROJECTS_SIG:
+        _PROJECTS_FORCE_TRIES = 0        # 已一致 → 清零
+        return data
+    now = time.time()
+    if now - _PROJECTS_FORCE_TS < MONITORING_TTL:
+        return data                      # 节流
+    if sig != _PROJECTS_TRY_SIG:         # 换了一处不一致 → 重新计数
+        _PROJECTS_TRY_SIG = sig
+        _PROJECTS_FORCE_TRIES = 0
+    if _PROJECTS_FORCE_TRIES >= PROJECTS_FORCE_MAX_TRIES:
+        return data                      # 上游迟迟不同步 → 放弃，等 PROJECTS_TTL
+    _PROJECTS_FORCE_TS = now
+    _PROJECTS_FORCE_TRIES += 1
+    data = get_projects(force=True)
+    try:
+        payload_ids = {p.get("id") for p in (data.get("projects") or []) if isinstance(p, dict)}
+    except Exception:
+        payload_ids = set()
+    if {t[0] for t in sig} <= payload_ids:   # 上游已同步 → 基线更新、计数清零
+        _PROJECTS_SIG = sig
+        _PROJECTS_FORCE_TRIES = 0
+    return data
+
+
+def _filter_projects_payload(data):
+    """把 projects 响应按活跃白名单过滤 + 按创建时间倒序，返回**新的 dict**。
+
+    注意不能就地改传入的 dict：传进来的就是 projects 缓存本体，就地过滤会把缓存
+    永久裁掉一批项目（之后 get_project() 就再也找不到它们了）。
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        return data
+    out = dict(data)
+    projects = data["projects"]
+    active = _active_project_ids()
+    if active is not None:
+        projects = [p for p in projects if p.get("id") in active]
+    out["projects"] = _sort_projects_desc(projects)   # 新项目排最前
+    return out
+
+
+def get_users():
+    """全部用户 id -> display_name（来自 /api/admin/users），供名字映射"""
+    data = cache_get("users", ttl=300)
+    if data is None:
+        status, h, raw = upstream("GET", "/api/admin/users", token=_get_owner_token())
+        data = json.loads(raw.decode("utf-8"))
+        cache_set("users", data, ttl=300)
+    return data
+
+
+def build_uid_name_map():
+    """uid -> 名字，来自 /api/admin/users（display_name）"""
+    m = {}
+    try:
+        d = get_users()
+        for u in d.get("users", []):
+            if isinstance(u, dict) and u.get("id"):
+                m[u["id"]] = u.get("display_name") or u.get("email") or u["id"]
+    except Exception:
+        pass
+    return m
+
+
+def build_qc_owner_map(pid):
+    """pic_base -> 质检员名字"""
+    proj = get_project(pid)
+    names = build_uid_name_map()
+    result = {}
+    if proj:
+        qa = proj.get("qc_assignments") or {}
+        for uid, files in qa.items():
+            nm = names.get(uid, uid)
+            for f in files:
+                base = os.path.splitext(os.path.basename(f))[0]
+                result[base] = nm
+    return result
+
+
+def category_to_export_idx(proj, cat_name):
+    """分类名 -> 导出用的 1-based 编号"""
+    cats = proj.get("categories", []) or []
+    for i, c in enumerate(cats):
+        if c == cat_name:
+            return i + 1
+    return None
+
+
+def category_match_bases(pid, cat_names):
+    """返回命中任一分类的图 base_name 集合；cat_names 为空或全无效时返回 None（不过滤）"""
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    idxs = set()
+    for c in (cat_names or []):
+        i = category_to_export_idx(proj, c)
+        if i is not None:
+            idxs.add(i)
+    if not idxs:
+        return None
+    labels = get_export_labels(pid)
+    bases = set()
+    for item in labels.get("labels", []):
+        pic = item.get("pic_id", "")
+        for b in item.get("bboxes", []):
+            if len(b) >= 5 and b[4] in idxs:
+                bases.add(_base_name(pic))
+                break
+    return bases
+
+
+# ======================================================================
+# 查询逻辑
+# ======================================================================
+def _base_name(pic):
+    return os.path.splitext(os.path.basename(pic))[0]
+
+
+def _image_id(pic):
+    return pic if pic.endswith(".jpg") else pic + ".jpg"
+
+
+def _fmt_ts(epoch):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+# annotation 状态缓存：qc_status/reviewed_at 短时间不变，缓存 30s。
+# _reconcile_overrides 会对所有本地纠正（pass/reject）逐张拉 annotation，若每次都现查，
+# 累计打回图多时会拖慢列表/计数请求（首屏与提交后卡顿的主因之一）。
+# 键是 (pid, image_id)：6000 图 × 多项目会很大，所以必须"过期即删 + 上限淘汰"。
+_ANNOTATION_CACHE = collections.OrderedDict()   # (pid, image_id) -> (expire_ts, value)
+_ANNOTATION_CACHE_LOCK = threading.Lock()
+_ANNOTATION_CACHE_MAX = 5000
+
+
+def _annotation_cache_get(pid, img):
+    key = (pid, img)
+    with _ANNOTATION_CACHE_LOCK:
+        ent = _ANNOTATION_CACHE.get(key)
+        if ent and time.time() < ent[0]:
+            _ANNOTATION_CACHE.move_to_end(key)
+            return ent[1]
+        if ent:
+            _ANNOTATION_CACHE.pop(key, None)   # 过期即删
+    return None
+
+
+def _annotation_cache_put(pid, img, v):
+    key = (pid, img)
+    with _ANNOTATION_CACHE_LOCK:
+        _ANNOTATION_CACHE[key] = (time.time() + 30, v)
+        _ANNOTATION_CACHE.move_to_end(key)
+        while len(_ANNOTATION_CACHE) > _ANNOTATION_CACHE_MAX:
+            _ANNOTATION_CACHE.popitem(last=False)
+
+
+def _annotation_cache_drop(pid, img):
+    with _ANNOTATION_CACHE_LOCK:
+        _ANNOTATION_CACHE.pop((pid, img), None)
+
+
+def _annotation_cache_clear_pid(pid):
+    with _ANNOTATION_CACHE_LOCK:
+        for k in [k for k in _ANNOTATION_CACHE if k[0] == pid]:
+            _ANNOTATION_CACHE.pop(k, None)
+
+
+def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
+    """并发拉取每张图的 qc_status + reviewed_at（带 30s 短缓存）
+
+    这是**批量扇出**：上游请求一律带 bulk=True，最多占一半全局并发槽
+    （见 upstream 的 bulk 参数），把另一半留给交互请求。
+    """
+    data = {}
+    _PROGRESS["phase"] = "annotation"
+    _PROGRESS["total"] = len(image_ids)
+    _PROGRESS["done"] = 0
+    def _one(img):
+        cached = _annotation_cache_get(pid, img)
+        if cached is not None:
+            return img, cached
+        s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid,
+                             query={"image_id": img}, token=_get_owner_token(),
+                             bulk=True)
+        try:
+            d = json.loads(raw.decode("utf-8"))
+            v = {"qc_status": d.get("qc_status") or "",
+                 "reviewed_at": d.get("reviewed_at") or ""}
+        except Exception:
+            v = {"qc_status": "", "reviewed_at": ""}
+        if s == 200:
+            _annotation_cache_put(pid, img, v)   # 失败（401/502）不缓存，避免被当成「无状态」
+        return img, v
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for img, v in ex.map(_one, image_ids):
+            data[img] = v
+            _PROGRESS["done"] += 1
+    return data
+
+
+# 本地 verdict 纠正的复核宽限期：刚点通过/打回时不立刻用 /annotation 复核，
+# 否则上游状态还没落库，会把刚提交的纠正错误撤销（这正是当初只复核 reject 的原因）。
+OVERRIDE_VERIFY_GRACE = 60   # 秒
+
+
+def _reconcile_overrides(pid, overrides, ts_of, limit=None):
+    """用 /annotation 的实时状态复核本地 verdict 纠正（**pass 与 reject 都要复核**）。
+
+    本地纠正记录的是「质检员点了通过/打回」这一动作，但它没有失效机制；作业员在**另一台机器**
+    重新提交标注后，平台真实 qc_status 已变回 pending，而纠正优先级高于 /images 快照，
+    所以不复核就会一直挂在「已通过」。此处逐张实时复核：
+    - pending  → 撤销纠正、标记 pending，让该图立刻回到「待质检」
+    - passed   → 标记 pass
+    - rejected → 标记 reject
+    - 拿不到状态 → 保留原纠正（不猜）
+
+    距提交不足 OVERRIDE_VERIFY_GRACE 的先跳过；复核是双向的，即使因上游滞后误撤销，
+    上游一致后下一次复核会改回来（自愈）。
+
+    limit 非空时只复核最新的一批（overrides 由 _recent_verdict_overrides 按「最新组优先」
+    插入，dict 顺序即新→旧）。这是为了让**冷缓存时的同步复核**有上界，不至于一次打出
+    上百个上游请求把 _UPSTREAM_SEM 占满、堵住并发的「下一张图 / 下一次提交」。
+    """
+    now = time.time()
+    ids = [k for k, v in overrides.items()
+           if v in ("reject", "pass") and (now - (ts_of.get(k) or 0)) >= OVERRIDE_VERIFY_GRACE]
+    if not ids:
+        return overrides
+    if limit is not None and len(ids) > limit:
+        ids = ids[:limit]
+    fresh = fetch_annotations(pid, ids)
+    for k in ids:
+        st = (fresh.get(k) or {}).get("qc_status") or ""
+        if st == "pending":
+            overrides[k] = "pending"
+        elif st == "passed":
+            overrides[k] = "pass"
+        elif st == "rejected":
+            overrides[k] = "reject"
+        # 拿不到状态：保留原纠正
+    return overrides
+
+
+# 复核结果缓存：_reconcile_overrides 会对本地纠正（pass + reject）逐张拉 annotation
+# （最多约 100 张），而它每次列表/计数请求都会跑一遍，是首屏与提交后「卡 2~3 秒」的主因。
+# 所以：① 给结果一个短 TTL 缓存；② 过期也不阻塞请求，先用旧值、后台异步复核
+# （stale-while-revalidate，与 get_images 同一套写法）。
+OVERRIDES_TTL = 15          # 复核结果缓存（沿用原 15s）
+OVERRIDES_COLD_MAX = 12     # 冷启动时同步复核的上限：12 张 ≈ 0.3s，不阻塞
+# 复核的并发上限不在这里控制：它走 fetch_annotations → upstream(bulk=True)，
+# 由 _BULK_SEM(4) 统一限制（见文件顶部「批量让路」的说明）。
+
+_OVERRIDES_CACHE = {}          # (pid, uid) -> (expire_ts, overrides)
+_OVERRIDES_CACHE_LOCK = threading.Lock()
+_OVERRIDES_REFRESHING = set()  # 正在后台复核的 (pid, uid)，单飞
+
+
+def _compute_overrides(pid, uid, limit=None):
+    overrides, ts_of = _recent_verdict_overrides(pid, uid)
+    overrides = _reconcile_overrides(pid, overrides, ts_of, limit)
+    with _OVERRIDES_CACHE_LOCK:
+        _OVERRIDES_CACHE[(pid, uid)] = (time.time() + OVERRIDES_TTL, overrides)
+    return overrides
+
+
+def _refresh_overrides_async(pid, uid):
+    """后台复核，不阻塞请求；同一个 (pid, uid) 只跑一个线程。"""
+    key = (pid, uid)
+    with _OVERRIDES_CACHE_LOCK:
+        if key in _OVERRIDES_REFRESHING:
+            return
+        _OVERRIDES_REFRESHING.add(key)
+
+    def _run():
+        try:
+            _compute_overrides(pid, uid)
+        except Exception:
+            pass
+        finally:
+            with _OVERRIDES_CACHE_LOCK:
+                _OVERRIDES_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def get_overrides(pid, uid):
+    key = (pid, uid)
+    with _OVERRIDES_CACHE_LOCK:
+        ent = _OVERRIDES_CACHE.get(key)
+    if ent is not None and time.time() < ent[0]:
+        return ent[1]
+    if ent is None:
+        # 本进程第一次算：同步算一次，但只复核最新的一小批，绝不打出满额风暴
+        return _compute_overrides(pid, uid, limit=OVERRIDES_COLD_MAX)
+    # 过期：先用旧值（stale-while-revalidate），后台复核
+    _refresh_overrides_async(pid, uid)
+    return ent[1]
+
+
+def note_overrides(pid, uid, verdicts):
+    """把刚提交的 verdict 就地写进复核缓存，而不是把整块缓存清掉。
+
+    以前提交后 clear_overrides_cache()，下一次列表请求就要对上百张本地纠正做全量
+    /annotation 复核（16 并发占满 _UPSTREAM_SEM(8)），把并发的「下一张图 / 下一次提交」
+    堵上 2~3 秒 —— 就是「点通过偶尔要等一两秒才下一张」。
+    """
+    if not pid or not uid or not verdicts:
+        return
+    key = (pid, uid)
+    with _OVERRIDES_CACHE_LOCK:
+        ent = _OVERRIDES_CACHE.get(key)
+        if ent is None:
+            return                       # 还没算过：下次算的时候自然带上（_RECENT_GROUPS 已更新）
+        overrides = ent[1]
+        for iid, v in verdicts.items():
+            if not iid:
+                continue
+            if v == "pending":
+                overrides.pop(iid, None)  # 回到「以快照 / _SAVE_PENDING」为准
+            else:
+                overrides[iid] = v
+        _OVERRIDES_CACHE[key] = (time.time() + OVERRIDES_TTL, overrides)
+
+
+def note_overrides_saved(pid, image_id):
+    """保存标注后该图在平台被重置为 pending：把该图从复核缓存里摘掉。
+
+    qc_save 拿不到质检员 uid，所以按 pid 匹配所有质检员的缓存条目。
+    """
+    if not pid or not image_id:
+        return
+    with _OVERRIDES_CACHE_LOCK:
+        for key, (exp, ov) in list(_OVERRIDES_CACHE.items()):
+            if key[0] != pid or image_id not in ov:
+                continue
+            ov.pop(image_id, None)
+            _OVERRIDES_CACHE[key] = (time.time() + OVERRIDES_TTL, ov)
+
+
+def clear_overrides_cache():
+    with _OVERRIDES_CACHE_LOCK:
+        _OVERRIDES_CACHE.clear()
+        _OVERRIDES_REFRESHING.clear()
+
+
+def _image_info_map(pid):
+    """image_id -> {annotated, box_count, qc_status, pre_annotated}（来自 /images 快照）
+
+    annotated=False 即「未作业」（作业员还没做过）；这类图的 box_count 是模型预标注框数，
+    qc_status 为 null。
+    """
+    info = {}
+    for im in get_images(pid).get("images", []):
+        iid = im.get("image_id")
+        if not iid:
+            continue
+        info[iid] = {
+            "annotated": bool(im.get("annotated")),
+            "box_count": im.get("box_count") or 0,
+            "qc_status": im.get("qc_status") or "",
+            "pre_annotated": bool(im.get("pre_annotated")),
+        }
+    return info
+
+
+def query_images(pid, cat_names, sort=None, passed_minutes=None):
+    """按一个或多个分类名查命中图；cat_names 为空时返回全部图片
+    （人工已标注的取自导出，未作业的取自 /images 并记 qc_status="unannotated"）
+    passed_minutes>0 时，只返回该时间窗内新通过、且当前仍为 passed 的图，按通过时间倒序"""
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    idxs = set()
+    for c in cat_names:
+        i = category_to_export_idx(proj, c)
+        if i is not None:
+            idxs.add(i)
+    # 排序/通过时间查询需要最新图列表（刚新分配到质检员的图会出现在导出里），强制刷新导出
+    force_export = bool(sort == "reviewed_desc" or passed_minutes)
+    _PROGRESS["phase"] = "export"
+    _PROGRESS["total"] = 0
+    _PROGRESS["done"] = 0
+    labels = get_export_labels(pid, force=force_export)
+    img_info = _image_info_map(pid)
+    owner_map = build_qc_owner_map(pid)
+    results = []
+    seen_bases = set()
+    for item in labels.get("labels", []):
+        pic = item.get("pic_id", "")
+        base = _base_name(pic)
+        if idxs:
+            boxes = []
+            for b in item.get("bboxes", []):
+                if len(b) >= 5 and b[4] in idxs:
+                    boxes.append({"x": b[0], "y": b[1], "w": b[2], "h": b[3]})
+            if not boxes:
+                continue
+            box_count = len(boxes)
+        else:
+            boxes = []
+            box_count = len(item.get("bboxes", []))
+        info = img_info.get(_image_id(pic)) or {}
+        results.append({
+            "image_id": _image_id(pic),
+            "boxes": boxes,
+            "box_count": box_count,
+            "qc_status": info.get("qc_status") or "?",
+            "qc_owner": owner_map.get(base, ""),
+        })
+        seen_bases.add(base)
+    if not idxs:
+        # 未作业图：只在「不选标签」时补进来——未作业图没有人工标注，命中不了任何标签
+        for iid, info in img_info.items():
+            if info["annotated"] or _base_name(iid) in seen_bases:
+                continue
+            results.append({
+                "image_id": iid,
+                "boxes": [],
+                "box_count": info["box_count"],
+                "qc_status": "unannotated",
+                "qc_owner": owner_map.get(_base_name(iid), ""),
+                "pre_annotated": info["pre_annotated"],
+            })
+    # 未作业图没有 reviewed_at，也不可能是 passed：排序/时间窗只对有人工标注的行拉实时状态
+    annotated_ids = [r["image_id"] for r in results if r["qc_status"] != "unannotated"]
+    if passed_minutes:
+        # 通过时间过滤：用实时 annotation 判断「N 分钟内通过且当前仍 passed」
+        cutoff = _fmt_ts(time.time() - passed_minutes * 60)
+        ann = fetch_annotations(pid, annotated_ids)
+        filtered = []
+        for r in results:
+            a = ann.get(r["image_id"], {})
+            r["qc_status"] = a.get("qc_status") or r.get("qc_status")
+            r["reviewed_at"] = a.get("reviewed_at") or ""
+            if r["qc_status"] == "passed" and r["reviewed_at"] >= cutoff:
+                filtered.append(r)
+        filtered.sort(key=lambda r: r["reviewed_at"], reverse=True)
+        return filtered
+    if sort == "reviewed_desc":
+        # 用实时 annotation 的 reviewed_at + qc_status，避免 /images 快照延迟
+        ann = fetch_annotations(pid, annotated_ids)
+        for r in results:
+            a = ann.get(r["image_id"])
+            if not a:
+                continue
+            r["qc_status"] = a.get("qc_status") or r.get("qc_status")
+            r["reviewed_at"] = a.get("reviewed_at") or ""
+        # 新→旧；空时间（未作业/待质检）排最后
+        results.sort(key=lambda r: r.get("reviewed_at") or "", reverse=True)
+    return results
+
+
+def false_pass_images(pid, cat_names):
+    """误通过：已质检通过、但仍带这些（禁止出现的）标签的图
+
+    标签是手填的，写错就必须明确报错——否则空命中会被当成「查全部」，
+    把「所有已通过的图」当成本次核查结果（假阳性）。
+    """
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    unknown = [c for c in cat_names if category_to_export_idx(proj, c) is None]
+    if unknown:
+        raise RuntimeError("标签不存在：" + "、".join(unknown) + "（本项目分类：" + "、".join(proj.get("categories") or []) + "）")
+    return [r for r in query_images(pid, cat_names) if r["qc_status"] == "passed"]
+
+
+def distribution(pid):
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    cats = proj.get("categories", []) or []
+    counts = {c: 0 for c in cats}
+    labels = get_export_labels(pid)
+    for item in labels.get("labels", []):
+        for b in item.get("bboxes", []):
+            if len(b) >= 5:
+                idx = b[4] - 1
+                if 0 <= idx < len(cats):
+                    counts[cats[idx]] += 1
+    return [{"category": c, "count": counts[c]} for c in cats]
+
+
+def search_images(pid, q):
+    """按文件名子串搜索图片（含 qc_status / box_count / 质检员）"""
+    ql = (q or "").lower()
+    imgs = get_images(pid)
+    owner_map = build_qc_owner_map(pid)
+    results = []
+    for im in imgs.get("images", []):
+        iid = im.get("image_id", "")
+        if ql in iid.lower():
+            base = os.path.splitext(os.path.basename(iid))[0]
+            results.append({
+                "image_id": iid,
+                "qc_status": im.get("qc_status"),
+                "box_count": im.get("box_count"),
+                "annotated": im.get("annotated"),
+                "qc_owner": owner_map.get(base, ""),
+            })
+    return results
+
+
+# ======================================================================
+# 质检平台
+# ======================================================================
+def qc_setup():
+    """返回项目与各项目质检员（uid/name），供质检平台初始化。
+    发布版（release）按当前登录用户锁定（admin 保留切换）。"""
+    proj_data = get_projects_for_ui()
+    names = build_uid_name_map()
+    active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
+    # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
+    projects = _sort_projects_desc(proj_data.get("projects", []))
+    if RELEASE_MODE:
+        uid = _current_uid()
+        role = (USER or {}).get("role") or ""
+        is_admin = (role == "admin")
+        out = []
+        for p in projects:
+            pid = p.get("id")
+            if active is not None and pid not in active:
+                continue
+            qc_assignees = p.get("qc_assignees") or []
+            if not is_admin and uid not in qc_assignees and uid not in (p.get("qc_assignments") or {}):
+                continue
+            reviewers = ([{"uid": u, "name": names.get(u, u), "has_login": False} for u in qc_assignees]
+                         if is_admin else
+                         [{"uid": uid, "name": names.get(uid, uid), "has_login": False}])
+            out.append({"id": pid, "name": p.get("name"), "reviewers": reviewers,
+                        "categories": p.get("categories") or []})
+        return out
+    out = []
+    for p in projects:
+        pid = p.get("id")
+        if active is not None and pid not in active:
+            continue
+        reviewers = [{"uid": uid, "name": names.get(uid, uid), "has_login": uid in _QC_LOGIN}
+                     for uid in p.get("qc_assignees") or []]
+        out.append({"id": pid, "name": p.get("name"), "reviewers": reviewers,
+                    "categories": p.get("categories") or []})
+    return out
+
+
+def _recent_verdict_overrides(pid, uid):
+    """返回 (image_id -> verdict, image_id -> 该纠正的提交时间)。
+
+    用于纠正 /images 的状态滞后，最新提交优先（_RECENT_GROUPS 新组在前，配合「首次出现即采用」）。
+    ts_of 供复核时判断宽限期，必须取「提供该纠正的最新组」的时间。
+    """
+    overrides = {}
+    ts_of = {}
+    for g in _RECENT_GROUPS:
+        if g.get("pid") == pid and g.get("uid") == uid:
+            for k, v in (g.get("verdicts") or {}).items():
+                if k not in overrides:          # 最新的组优先
+                    overrides[k] = v
+                    ts_of[k] = g.get("ts") or 0
+    return overrides, ts_of
+
+
+def _is_force(qs):
+    """查询串里的 force 标志（force=1/true/yes）：为真时打穿服务端内存缓存，强制取最新"""
+    return (qs.get("force", [""])[0] or "").lower() in ("1", "true", "yes")
+
+
+def _qc_status_resolver(pid, uid, force=False, _retry=True):
+    """返回 (files, resolve, box_map, snapshot_missing)。
+
+    counts 与 items 必须复用同一次调用的结果：/images 是 stale-while-revalidate 快照，
+    若两者各拉一次，后台刷新恰好落在这两次请求之间就会让计数与列表永久不一致。
+
+    snapshot_missing = 该质检员名下有分配、但 /images 快照里完全没有的图数。
+    快照缺图时 resolve() 返回 None，被 _qc_counts_of 记成「作业中」，三个页签却一张都不显示
+    （就是「小圈有数字、列表空、中间纯黑」）。这里先自救一次，再把这个数量报给前端解释。
+    """
+    if force:
+        _force_refresh(pid)
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    files = (proj.get("qc_assignments") or {}).get(uid) or []
+    status_map = {}
+    box_map = {}
+    for im in get_images(pid).get("images", []):
+        iid = im.get("image_id")
+        if iid:
+            status_map[iid] = im.get("qc_status")
+            box_map[iid] = im.get("box_count") or 0
+    # 名下有图、快照却一张都没有 → 快照明显不完整（新建项目/刚加图时常见），
+    # 同步强拉一次再判；只重试 1 次，避免把上游拖慢
+    if files and not status_map and _retry:
+        try:
+            _fetch_images_sync(pid, force=True)
+        except Exception:
+            pass
+        return _qc_status_resolver(pid, uid, force=False, _retry=False)
+    overrides = get_overrides(pid, uid)
+    save_pending = _SAVE_PENDING.get(pid) or set()
+
+    def resolve(f):
+        if f in overrides:
+            v = overrides[f]
+            return "passed" if v == "pass" else ("pending" if v == "pending" else "rejected")
+        if f in save_pending:
+            return "pending"
+        return status_map.get(f)
+
+    snapshot_missing = sum(1 for f in files if f not in status_map)
+    return files, resolve, box_map, snapshot_missing
+
+
+def _qc_counts_of(files, resolve):
+    total = len(files)
+    pending = passed = rejected = 0
+    for f in files:
+        st = resolve(f)
+        if st == "pending":
+            pending += 1
+        elif st == "passed":
+            passed += 1
+        elif st == "rejected":
+            rejected += 1
+    return {"total": total, "annotating": total - pending - passed - rejected,
+            "pending": pending, "passed": passed, "rejected": rejected}
+
+
+def qc_counts(pid, uid, force=False):
+    """返回 (counts, snapshot_missing)：总数 / 作业中 / 待质检 / 已通过 / 已打回"""
+    files, resolve, _, snapshot_missing = _qc_status_resolver(pid, uid, force)
+    return _qc_counts_of(files, resolve), snapshot_missing
+
+
+def qc_recent(pid, uid, force=False):
+    """返回该质检员最近提交的照片（按提交顺序，最新在前，最多 3 组=12 张）+ 实时计数"""
+    out = []
+    for g in _RECENT_GROUPS:
+        if g.get("pid") == pid and g.get("uid") == uid:
+            out.extend(g.get("image_ids") or [])
+    files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
+    items = out[:12]
+    box_counts = {f: box_map.get(f, 0) for f in items}
+    return {"items": items, "box_counts": box_counts,
+            "counts": _qc_counts_of(files, resolve), "snapshot_missing": snapshot_missing}
+
+
+def qc_save(pid, image_id, boxes):
+    """保存某张图的标注框（整体替换）。返回 {ok, box_count} 或 {ok, error}
+    用 owner（管理员）token 保存：质检员本人无「保存标注」权限，需以管理员身份落框。"""
+    s, h, raw = upstream("POST", "/api/projects/%s/save" % pid,
+                         body={"image_id": image_id, "boxes": boxes},
+                         token=_get_owner_token())
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except Exception:
+        d = {}
+    if s == 200 and d.get("ok"):
+        _clear_cache_keep_stable()
+        # 该图标注已变更，平台会重置为 pending；清除本地最近提交里对它的状态纠正，
+        # 否则「已打回」等列表仍会按旧 verdict 显示它
+        for g in _RECENT_GROUPS:
+            if g.get("pid") == pid:
+                (g.get("verdicts") or {}).pop(image_id, None)
+        # 记录「保存后应为 pending」的纠正，弥补 /images 快照滞后
+        _SAVE_PENDING.setdefault(pid, set()).add(image_id)
+        # 该图在复核缓存里立刻失效（就地摘掉，不清整块，避免下一次列表请求打全量复核）
+        note_overrides_saved(pid, image_id)
+        return {"ok": True, "box_count": d.get("box_count", len(boxes))}
+    return {"ok": False, "error": d.get("error") or ("HTTP %s" % s)}
+
+
+def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
+    """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names 非空时按属性过滤。
+
+    同时返回 counts（与 items 同一快照、同一过滤范围），供前端一次请求同时渲染徽标与列表。
+    snapshot_missing：名下有分配、但 /images 快照里完全没有的图数 —— 快照缺图时前端据此
+    解释「小圈有数字、列表空」，而不是干瞪着纯黑。
+    """
+    files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
+    cat_bases = category_match_bases(pid, cat_names) if cat_names else None
+    if cat_bases is not None:
+        files = [f for f in files if _base_name(f) in cat_bases]
+    counts = _qc_counts_of(files, resolve)
+    matched = [f for f in files if resolve(f) == status]
+    total = len(matched)
+    items = matched[offset:offset + limit]
+    box_counts = {f: box_map.get(f, 0) for f in items}
+    return {"total": total, "items": items, "box_counts": box_counts,
+            "counts": counts, "snapshot_missing": snapshot_missing}
+
+
+def anno_setup():
+    """返回项目与各项目作业员（uid/name/has_login），供作业平台初始化。
+    发布版（release）按当前登录用户锁定（admin 保留切换）。"""
+    proj_data = get_projects_for_ui()
+    names = build_uid_name_map()
+    active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
+    # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
+    projects = _sort_projects_desc(proj_data.get("projects", []))
+    if RELEASE_MODE:
+        uid = _current_uid()
+        role = (USER or {}).get("role") or ""
+        is_admin = (role == "admin")
+        out = []
+        for p in projects:
+            pid = p.get("id")
+            if active is not None and pid not in active:
+                continue
+            assignees = p.get("assignees") or []
+            if not is_admin and uid not in assignees and uid not in (p.get("assignments") or {}):
+                continue
+            annotators = ([{"uid": u, "name": names.get(u, u), "has_login": False} for u in assignees]
+                          if is_admin else
+                          [{"uid": uid, "name": names.get(uid, uid), "has_login": False}])
+            out.append({"id": pid, "name": p.get("name"), "annotators": annotators,
+                        "categories": p.get("categories") or []})
+        return out
+    out = []
+    for p in projects:
+        pid = p.get("id")
+        if active is not None and pid not in active:
+            continue
+        annotators = [{"uid": uid, "name": names.get(uid, uid), "has_login": uid in _QC_LOGIN}
+                      for uid in p.get("assignees") or []]
+        out.append({"id": pid, "name": p.get("name"), "annotators": annotators,
+                    "categories": p.get("categories") or []})
+    return out
+
+
+def daily_stats(uid):
+    """每日标注量/质检量。发布版用当前登录用户 token；开发版用所选内置账号 token。"""
+    if RELEASE_MODE:
+        if not TOKEN:
+            return {"ok": True, "has_login": False}
+        tok = TOKEN
+    else:
+        if not uid or uid not in _QC_LOGIN:
+            return {"ok": True, "has_login": False}
+        tok = _get_qc_token(uid)
+        if not tok:
+            return {"ok": False, "error": "无法登录该账号"}
+    s, h, raw = upstream("GET", "/api/my_daily_stats", token=tok)
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except Exception:
+        d = {}
+    if s != 200 or not d.get("ok"):
+        return {"ok": False, "error": d.get("error") or ("HTTP %s" % s)}
+    return {"ok": True, "has_login": True,
+            "annotated_days": d.get("annotated_days") or [],
+            "qc_days": d.get("qc_days") or []}
+
+
+def anno_qc_owners(pid, uid):
+    """返回某作业员名下每张图归哪个质检员：qc_of(image_id -> {uid,name}) + qcs(去重质检员列表)"""
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    files = (proj.get("assignments") or {}).get(uid) or []
+    names = build_uid_name_map()
+    qc_uid_of = {}
+    for qc_uid, flist in (proj.get("qc_assignments") or {}).items():
+        for f in flist:
+            qc_uid_of[os.path.splitext(os.path.basename(f))[0]] = qc_uid
+    qc_of = {}
+    qcs = {}
+    for f in files:
+        base = os.path.splitext(os.path.basename(f))[0]
+        qc_uid = qc_uid_of.get(base) or ""
+        if qc_uid:
+            nm = names.get(qc_uid, qc_uid)
+            qc_of[f] = {"uid": qc_uid, "name": nm}
+            qcs.setdefault(qc_uid, nm)
+    return {"qc_of": qc_of, "qcs": [{"uid": u, "name": n} for u, n in qcs.items()]}
+
+
+def qc_annotator_owners(pid, uid):
+    """返回某质检员名下每张图由哪个作业员标注：ann_of(image_id -> {uid,name}) + anns(去重作业员列表)"""
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    files = (proj.get("qc_assignments") or {}).get(uid) or []
+    names = build_uid_name_map()
+    ann_uid_of = {}
+    for a_uid, flist in (proj.get("assignments") or {}).items():
+        for f in flist:
+            ann_uid_of[os.path.splitext(os.path.basename(f))[0]] = a_uid
+    ann_of = {}
+    anns = {}
+    for f in files:
+        base = os.path.splitext(os.path.basename(f))[0]
+        a_uid = ann_uid_of.get(base) or ""
+        if a_uid:
+            nm = names.get(a_uid, a_uid)
+            ann_of[f] = {"uid": a_uid, "name": nm}
+            anns.setdefault(a_uid, nm)
+    return {"ann_of": ann_of, "anns": [{"uid": u, "name": n} for u, n in anns.items()]}
+
+
+def anno_rejected_bases(pid):
+    """返回当前被质检打回的图 base_name 集合（跨所有质检员，含实时复核撤销已重提交的）。
+    用于作业平台的「被打回」页，弥补 /images 快照滞后导致打回图不显示的问题。"""
+    overrides = {}
+    ts_of = {}
+    for g in _RECENT_GROUPS:
+        if g.get("pid") == pid:
+            for k, v in (g.get("verdicts") or {}).items():
+                if k not in overrides:      # 最新组优先
+                    overrides[k] = v
+                    ts_of[k] = g.get("ts") or 0
+    if not overrides:
+        return set()
+    overrides = _reconcile_overrides(pid, overrides, ts_of)
+    return {_base_name(k) for k, v in overrides.items() if v == "reject"}
+
+
+def _anno_status_resolver(pid, uid, force=False):
+    """返回 (files, bucket, info)。bucket(f) -> 'unannotated' | 'submitted' | 'rejected'。
+
+    与质检侧同理：counts 与 items 必须复用同一次解析结果，否则 /images 快照的后台刷新
+    会让徽标与列表不一致。
+    """
+    if force:
+        _force_refresh(pid)
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    files = (proj.get("assignments") or {}).get(uid) or []
+    info = {}
+    for im in get_images(pid).get("images", []):
+        iid = im.get("image_id")
+        if iid:
+            info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status"),
+                         "box_count": im.get("box_count") or 0}
+    save_pending = _SAVE_PENDING.get(pid) or set()
+    rejected_bases = anno_rejected_bases(pid)
+
+    def bucket(f):
+        if f in save_pending:
+            # 本地刚保存过 → 回到 pending，不再算「未作业」
+            return "submitted"
+        if _base_name(f) in rejected_bases:
+            # 最近被质检打回（/images 快照滞后），立即按 rejected 显示
+            return "rejected"
+        d = info.get(f) or {}
+        if d.get("qc_status") == "rejected":
+            return "rejected"
+        return "submitted" if d.get("annotated") else "unannotated"
+
+    return files, bucket, info
+
+
+def _anno_counts_of(files, bucket):
+    total = len(files)
+    unannotated = submitted = rejected = 0
+    for f in files:
+        b = bucket(f)
+        if b == "rejected":
+            rejected += 1
+        elif b == "submitted":
+            submitted += 1
+        else:
+            unannotated += 1
+    return {"total": total, "unannotated": unannotated, "submitted": submitted, "rejected": rejected}
+
+
+def anno_assigned(pid, uid, status, offset, limit, force=False):
+    """返回某作业员在指定作业状态下的图片列表（分页）。
+    status: 'unannotated'（未作业）| 'submitted'（已提交）| 'rejected'（被打回）
+
+    同时返回 counts（与 items 同一快照），供前端一次请求同时渲染徽标与列表。
+    """
+    files, bucket, info = _anno_status_resolver(pid, uid, force)
+    counts = _anno_counts_of(files, bucket)
+    matched = [f for f in files if bucket(f) == status]
+    total = len(matched)
+    items = matched[offset:offset + limit]
+    box_counts = {f: (info.get(f) or {}).get("box_count", 0) for f in items}
+    return {"total": total, "items": items, "box_counts": box_counts, "counts": counts}
+
+
+def anno_counts(pid, uid, force=False):
+    """返回某作业员的数量：总数 / 未作业 / 已提交 / 被打回"""
+    files, bucket, _ = _anno_status_resolver(pid, uid, force)
+    return _anno_counts_of(files, bucket)
+
+
+# ======================================================================
+# HTTP Handler
+# ======================================================================
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "LabelAutoDashboard/1.0"
+
+    def log_message(self, format, *args):
+        pass  # 静默，避免刷屏
+
+    # ---- 基础响应 ----
+    def _send(self, status, headers, body):
+        try:
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            # 客户端中途断开（翻页/关页面等），静默忽略，避免刷屏
+            pass
+
+    def _send_json(self, obj, status=200):
+        self._send(status, {"Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store"},
+                   json_bytes(obj))
+
+    def _serve_image(self, pid, query, token=None):
+        """带内存缓存的图片转发：命中缓存直接返回，未命中拉取上游并缓存，减少对上游的重复请求。
+
+        只把「真正的图片」（200 + Content-Type: image/* + body 非空）发给浏览器；
+        上游的错误（502/404 的 JSON）一律原样状态码 + no-store，绝不冒充 image/jpeg。
+        响应头不再发 immutable/max-age：图片内容虽然不可变，但一旦某次拿到坏响应，
+        immutable 会让浏览器一小时内不再重试 —— F5 和重新登录都救不回来，
+        只能去开发者工具里清站点数据（实测就是这么被坑的）。
+
+        token 是「当前页面正在以谁的身份看」那个人的 token（见 _acting_token）；
+        缺省 None 时 upstream() 回退全局 TOKEN，与旧行为一致。缓存键仍是 (pid, image_id)：
+        图片字节与身份无关（能拿到就是同一张图），403 不入缓存，换个身份会真的重试。
+        """
+        image_id = query.get("image_id", "")
+        if image_id:
+            cached = _image_cache_get(pid, image_id)
+            if cached:
+                ct, body = cached
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, body)
+        key = pid + "/" + image_id
+        with _IMAGE_INFLIGHT_LOCK:
+            evt = _IMAGE_INFLIGHT.get(key)
+            if evt is None:
+                evt = threading.Event()
+                _IMAGE_INFLIGHT[key] = evt
+                is_owner = True
+            else:
+                is_owner = False
+        if not is_owner:
+            # 同一张图已经有人在拉 → 等它，不重复打上游。
+            # 等不到缓存说明 owner 那次失败了（403/超时）：直接如实返回 502，
+            # 让前端自己去重试（viewer.js 有自动重试一次），而不是在这里再打一次上游
+            # —— 去重的语义就该是「要么等到，要么放弃」。
+            evt.wait(timeout=10)
+            cached = _image_cache_get(pid, image_id)
+            if cached:
+                ct, body = cached
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, body)
+            return self._send(502, {"Content-Type": "application/json",
+                                    "Cache-Control": "no-store"},
+                              json_bytes({"ok": False, "error": "图片正在加载中，请稍后重试"}))
+        try:
+            s, h, raw = upstream("GET", "/api/projects/%s/image" % pid, query=query, token=token)
+            ct = h.get("Content-Type") or ""
+            if s == 200 and ct.startswith("image/") and raw:
+                if image_id:
+                    _image_cache_put(pid, image_id, ct, raw)
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, raw)
+            # 不是真图片：原样状态码，不缓存、不冒充 image/*
+            return self._send(s or 502,
+                              {"Content-Type": ct or "application/octet-stream",
+                               "Cache-Control": "no-store"}, raw)
+        finally:
+            if is_owner:
+                with _IMAGE_INFLIGHT_LOCK:
+                    _IMAGE_INFLIGHT.pop(key, None)
+                evt.set()
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _is_local(self):
+        """请求是否来自本机（127.0.0.1 / ::1）。本机不做登录限制。"""
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _qc_gated(self, uid):
+        """质检/作业数据访问门槛。发布版只检查是否登录；开发版按内置/本地判断。"""
+        if RELEASE_MODE:
+            if TOKEN:
+                return None
+            return self._send_json({"ok": False, "need_login": True,
+                                    "error": "请先登录"}, 401)
+        if self._is_local():
+            return None
+        if uid in _QC_LOGIN:
+            return None  # 内置登录，_get_qc_token 会自动登录
+        if _QC_TOKENS.get(uid):
+            return None  # 已手动登录过
+        return self._send_json({"ok": False, "need_login": True,
+                                "error": "该质检员需要登录后才能查看数据"}, 401)
+
+    def _write_gate(self):
+        """写接口门槛。
+
+        发布版必须先登录（与读接口口径一致）；开发版保持原样 —— 开发版的"你是谁"完全由
+        客户端自报（X-User-Id / 请求体里的 uid），而 _get_qc_token(uid) 会用内置凭据自动
+        登录该 uid，所以给开发版写接口加门槛没有实际意义（自报一个内置 uid 就能过）。
+        真正的修法是"服务端记住 token 属于哪个 uid"，属于下一批的请求级鉴权。
+        """
+        if not RELEASE_MODE:
+            return None
+        return self._qc_gated(_current_uid())
+
+    # ---- 路由 ----
+    def do_GET(self):
+        self._route("GET")
+
+    def do_POST(self):
+        self._route("POST")
+
+    def _route(self, method):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        # 登录态由前端 localStorage 随请求头传来（发布版登录自己账号时用）
+        global TOKEN, USER
+        auth = self.headers.get("Authorization") or ""
+        tok_h = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        uid_h = self.headers.get("X-User-Id") or ""
+        role_h = self.headers.get("X-User-Role") or ""
+        if uid_h or role_h:
+            USER = {"id": uid_h, "role": role_h}
+        if RELEASE_MODE and uid_h:
+            # 发布版：token 以服务端为准。401 自愈后 _QC_TOKENS[uid] 是新 token，
+            # 浏览器 localStorage 里还是旧的，不能让它把新 token 覆盖回去。
+            TOKEN = _QC_TOKENS.get(uid_h) or tok_h or None
+        elif tok_h:
+            TOKEN = tok_h
+
+        # 静态文件
+        if path in ("/", "/index.html", "/qc", "/anno") or path.startswith("/static/"):
+            return self._serve_static(path)
+
+        # 登录 / 登出
+        if path == "/api/login" and method == "POST":
+            return self._handle_login()
+        if path == "/api/logout" and method == "POST":
+            uid = (USER or {}).get("id") or ""
+            if uid:
+                # 退出就忘掉这个人的 token 与明文凭据
+                _QC_TOKENS.pop(uid, None)
+                _USER_CREDENTIALS.pop(uid, None)
+            TOKEN = None
+            USER = None
+            clear_cache_all()
+            return self._send_json({"ok": True})
+
+        if path == "/api/me" and method == "GET":
+            return self._send_json({"ok": True, "user": USER})
+
+        if path == "/api/config" and method == "GET":
+            return self._send_json({"ok": True, "release": RELEASE_MODE})
+
+        # ---- 版本 / 更新（照片区右下角的版本号 + 更新按钮用） ----
+        # 只回版本号，无敏感信息，所以和 /api/config 一样不加门槛。
+        if path == "/api/update" and method == "GET":
+            info = update_status()
+            return self._send_json({"ok": True, "version": VERSION,
+                                    "latest": info["latest"],
+                                    "has_update": info["has_update"],
+                                    "can_update": bool(getattr(sys, "frozen", False))})
+
+        if path == "/api/update/apply" and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
+            info = update_status()
+            if not info["has_update"] or not info["url"] or len(info["sha256"]) != 64:
+                return self._send_json({"ok": False, "error": "当前已是最新版本"}, 400)
+            # 先回响应，再在后台真正更新（_do_update 要下载 + 替换 + 重启，不能让请求线程等）
+            threading.Timer(1.0, lambda: _do_update(info["url"], info["sha256"])).start()
+            return self._send_json({"ok": True, "message": "正在下载更新，完成后程序会自动重启"})
+
+        if path == "/api/projects" and method == "GET":
+            # 走缓存 + 探针强拉：看板下拉与各平台共用同一份项目列表，
+            # 避免前端每次轮询都去拉重的 /api/projects
+            try:
+                return self._send_json(_filter_projects_payload(get_projects_for_ui()))
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        if not RELEASE_MODE and path == "/api/monitoring" and method == "GET":
+            try:
+                return self._send_json(get_monitoring(force=bool(qs.get("force"))))
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        if not RELEASE_MODE and path == "/api/query_progress" and method == "GET":
+            return self._send_json({"ok": True, "progress": _PROGRESS})
+
+        # ---- 自动登录（于荣华，看板与质检平台共用；仅开发版） ----
+        # 发布版禁用：否则局域网任何人 GET 一次就能把全局身份改成 owner（也等于一个登录 CSRF 入口）。
+        # 发布版的前端本来就不调它（qc.js/anno.js 都是 RELEASE 分支走登录页）。
+        if not RELEASE_MODE and path in ("/api/qc/autologin", "/api/autologin") and method == "GET":
+            s, h, raw = upstream("POST", "/api/login",
+                                 body={"email": QC_EMAIL, "password": QC_PASSWORD})
+            if s == 200:
+                data = json.loads(raw.decode("utf-8"))
+                TOKEN = data.get("token")
+                USER = data.get("user")
+                return self._send_json({"ok": True, "user": USER})
+            return self._send_json({"ok": False, "error": "自动登录失败 HTTP %s" % s}, 500)
+
+        if path == "/api/qc/setup" and method == "GET":
+            try:
+                return self._send_json({"ok": True, "projects": qc_setup()})
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+
+        if path == "/api/anno/setup" and method == "GET":
+            try:
+                return self._send_json({"ok": True, "projects": anno_setup()})
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+
+        if path == "/api/daily_stats" and method == "GET":
+            uid = qs.get("uid", [""])[0]
+            return self._send_json(daily_stats(uid))
+
+        if path == "/api/anno/qc_owners" and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, **anno_qc_owners(pid, uid)})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        if path == "/api/qc/annotators" and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, **qc_annotator_owners(pid, uid)})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        m = re.match(r"^/api/anno/assigned$", path)
+        if m and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            status = qs.get("status", ["unannotated"])[0]
+            try:
+                offset = int(qs.get("offset", ["0"])[0] or 0)
+                limit = int(qs.get("limit", ["20"])[0] or 20)
+            except ValueError:
+                return self._send_json({"ok": False, "error": "分页参数非法"}, 400)
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, **anno_assigned(pid, uid, status, offset, limit,
+                                                                   force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        m = re.match(r"^/api/anno/counts$", path)
+        if m and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, "counts": anno_counts(pid, uid, force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        # 质检员手动登录（局域网访问且未内置登录时）
+        if path == "/api/qc/reviewer_login" and method == "POST":
+            raw = self._read_body()
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+            uid = body.get("uid") or ""
+            email = body.get("email") or ""
+            password = body.get("password") or ""
+            if not uid or not email or not password:
+                return self._send_json({"ok": False, "error": "参数非法"}, 400)
+            s, h, raw2 = upstream("POST", "/api/login", body={"email": email, "password": password})
+            if s == 200:
+                try:
+                    d = json.loads(raw2.decode("utf-8"))
+                    tok = d.get("token")
+                    if tok:
+                        _QC_TOKENS[uid] = tok
+                        return self._send_json({"ok": True})
+                except Exception:
+                    pass
+            return self._send_json({"ok": False, "error": "登录失败，请检查账号密码"}, 401)
+
+        m = re.match(r"^/api/qc/assigned$", path)
+        if m and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            status = qs.get("status", ["pending"])[0]
+            cat = qs.get("cat", [""])[0]
+            cat_names = [c for c in cat.split(",") if c] if cat else None
+            try:
+                offset = int(qs.get("offset", ["0"])[0] or 0)
+                limit = int(qs.get("limit", ["20"])[0] or 20)
+            except ValueError:
+                return self._send_json({"ok": False, "error": "分页参数非法"}, 400)
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, **qc_assigned(pid, uid, status, offset, limit, cat_names,
+                                                                 force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        m = re.match(r"^/api/qc/counts$", path)
+        if m and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                counts, snapshot_missing = qc_counts(pid, uid, force=_is_force(qs))
+                return self._send_json({"ok": True, "counts": counts,
+                                        "snapshot_missing": snapshot_missing})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        m = re.match(r"^/api/qc/recent$", path)
+        if m and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, **qc_recent(pid, uid, force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        m = re.match(r"^/api/qc/submit$", path)
+        if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
+            return self._handle_qc_submit()
+
+        m = re.match(r"^/api/qc/fix$", path)
+        if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
+            return self._handle_qc_fix()
+
+        m = re.match(r"^/api/qc/save$", path)
+        if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
+            raw = self._read_body()
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+            pid = body.get("pid") or ""
+            iid = body.get("image_id") or ""
+            boxes = body.get("boxes")
+            if not pid or not iid or not isinstance(boxes, list):
+                return self._send_json({"ok": False, "error": "参数非法"}, 400)
+            r = qc_save(pid, iid, boxes)
+            return self._send_json(r, 200 if r.get("ok") else 400)
+
+        # /api/projects/{id}/images
+        if not RELEASE_MODE:
+            m = re.match(r"^/api/projects/([^/]+)/images$", path)
+            if m and method == "GET":
+                s, h, raw = upstream("GET", "/api/projects/%s/images" % m.group(1))
+                return self._send(s, self._pick_headers(h), raw)
+
+        # /api/projects/{id}/image  /annotation
+        m = re.match(r"^/api/projects/([^/]+)/(image|annotation)$", path)
+        if m and method == "GET":
+            pid = m.group(1)
+            kind = m.group(2)
+            query = {k: v[0] for k, v in qs.items()}
+            uid = query.pop("uid", "")          # uid 只用于取 token，不转发给上游
+            tok = _acting_token(uid)
+            if kind == "image":
+                return self._serve_image(pid, query, token=tok)
+            s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid,
+                                 query=query, token=tok)
+            if s == 401:
+                # 给前端一个可识别的信号：以前 401 会被前端静默吞掉，
+                # 表现成「有图没框、右侧却有框数量」。
+                return self._send_json({"ok": False, "need_login": True,
+                                        "error": "登录已过期，请重新登录"}, 401)
+            return self._send(s, self._pick_headers(h), raw)
+
+        if not RELEASE_MODE:
+            # /api/projects/{id}/query?cat=a,b&sort=reviewed_desc
+            m = re.match(r"^/api/projects/([^/]+)/query$", path)
+            if m and method == "GET":
+                cats = [c for c in (qs.get("cat", [""])[0]).split(",") if c] if qs.get("cat") else []
+                sort = qs.get("sort", [""])[0] or None
+                pm_raw = qs.get("passed_minutes", [""])[0]
+                try:
+                    passed_minutes = int(pm_raw) if pm_raw else 0
+                except ValueError:
+                    passed_minutes = 0
+                try:
+                    return self._send_json({"ok": True, "results": query_images(m.group(1), cats, sort, passed_minutes)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
+
+            # /api/projects/{id}/false_pass?cats=a,b
+            m = re.match(r"^/api/projects/([^/]+)/false_pass$", path)
+            if m and method == "GET":
+                cats = [c for c in (qs.get("cats", [""])[0]).split(",") if c] if qs.get("cats") else []
+                try:
+                    return self._send_json({"ok": True, "results": false_pass_images(m.group(1), cats)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
+
+            # /api/projects/{id}/distribution
+            m = re.match(r"^/api/projects/([^/]+)/distribution$", path)
+            if m and method == "GET":
+                try:
+                    return self._send_json({"ok": True, "distribution": distribution(m.group(1))})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
+
+            # /api/projects/{id}/search?q=文件名子串
+            m = re.match(r"^/api/projects/([^/]+)/search$", path)
+            if m and method == "GET":
+                q = qs.get("q", [""])[0]
+                if not q:
+                    return self._send_json({"ok": False, "error": "缺少 q 参数"}, 400)
+                try:
+                    return self._send_json({"ok": True, "results": search_images(m.group(1), q)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
+
+            # /api/projects/{id}/preload  (GET，无操作，保留以兼容前端切换项目时的调用)
+            m = re.match(r"^/api/projects/([^/]+)/preload$", path)
+            if m and method == "GET":
+                return self._send_json({"ok": True})
+
+            # /api/export/{id}?mode=passed|full|yolo
+            m = re.match(r"^/api/export/([^/]+)$", path)
+            if m and method == "GET":
+                return self._export(m.group(1), qs.get("mode", ["full"])[0])
+
+            # /api/projects/{id}/batch_qc  (POST)
+            m = re.match(r"^/api/projects/([^/]+)/batch_qc$", path)
+            if m and method == "POST":
+                gate = self._write_gate()
+                if gate:
+                    return gate
+                return self._handle_batch_qc(m.group(1))
+
+        return self._send_json({"ok": False, "error": "未知接口: " + path}, 404)
+
+    # ---- 登录 ----
+    def _handle_login(self):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+        s, h, raw2 = upstream("POST", "/api/login", body=body)
+        if s == 200:
+            global TOKEN, USER
+            data = json.loads(raw2.decode("utf-8"))
+            TOKEN = data.get("token")
+            USER = data.get("user")
+            # 按 uid 记账：图片/标注转发按 uid 取本人 token；
+            # 记住凭据让 upstream 的 401 自愈能重新登录（发布版没有内置凭据）。
+            uid = (USER or {}).get("id") or ""
+            email = body.get("email") or ""
+            password = body.get("password") or ""
+            if uid and TOKEN:
+                _QC_TOKENS[uid] = TOKEN
+                if email and password:
+                    _USER_CREDENTIALS[uid] = {"email": email, "password": password}
+            return self._send_json(data)
+        return self._send(s, self._pick_headers(h), raw2)
+
+    # ---- 批量打回 / 通过 ----
+    def _handle_batch_qc(self, pid):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+        image_ids = body.get("image_ids") or []
+        verdict = body.get("verdict", "reject")
+        reason = body.get("reason", "") or ""
+        if not isinstance(image_ids, list) or not image_ids:
+            return self._send_json({"ok": False, "error": "image_ids 为空"}, 400)
+        if verdict not in ("reject", "pass"):
+            return self._send_json({"ok": False, "error": "verdict 只能是 reject 或 pass"}, 400)
+
+        # 与质检平台 /api/qc/submit 对齐：按每张图的「归属质检员」分别用其本人 token 提交。
+        # 否则平台不会把这条质检结果归属到该质检员名下，质检平台「已打回」永远拿不到它。
+        try:
+            proj = get_project(pid) or {}
+        except Exception:
+            proj = {}   # 拉不到项目就退化为整批按 owner 提交
+        owner_uid_of = {}
+        for qc_uid, flist in (proj.get("qc_assignments") or {}).items():
+            for f in flist:
+                owner_uid_of[_base_name(f)] = qc_uid
+
+        buckets = {}   # uid -> [image_id]；uid="" 表示未分配给任何质检员
+        for img in image_ids:
+            buckets.setdefault(owner_uid_of.get(_base_name(img), ""), []).append(img)
+
+        succeeded = 0
+        as_reviewer = 0   # 用质检员本人 token 成功
+        as_owner = 0      # 回退 owner token 成功
+        no_cred = []      # 归属质检员没有内置登录凭据 → 只能用 owner 提交，平台归属可能不对
+        failed = []
+        for uid, imgs in buckets.items():
+            tok = _get_qc_token(uid) if uid else None   # 拿不到则 upstream 回退全局 owner token
+            if uid and not tok:
+                no_cred.extend(imgs)
+            for img in imgs:
+                s, h, raw2 = upstream("POST", "/api/projects/%s/qc" % pid,
+                                      body={"image_id": img, "verdict": verdict, "reason": reason},
+                                      token=tok)
+                try:
+                    d = json.loads(raw2.decode("utf-8"))
+                except Exception:
+                    d = {}
+                if s == 200 and d.get("ok"):
+                    succeeded += 1
+                    if tok:
+                        as_reviewer += 1
+                    else:
+                        as_owner += 1
+                else:
+                    failed.append({"image_id": img,
+                                   "error": d.get("error") or ("HTTP %s" % s)})
+
+        # 写操作后清空缓存，并清掉复核缓存，否则 15s 内的旧结果会挡住刚写入的纠正
+        _CACHE.clear()
+        clear_overrides_cache()
+
+        # 记录本地纠正（弥补 /images 快照滞后）：该质检员的「已打回」与作业平台的「被打回」立刻可见
+        failed_ids = {f["image_id"] for f in failed}
+        if succeeded:
+            for uid, imgs in buckets.items():
+                ok_ids = [i for i in imgs if i not in failed_ids]
+                if not ok_ids:
+                    continue
+                _RECENT_GROUPS.insert(0, {
+                    "ts": time.time(),
+                    "pid": pid,
+                    "uid": uid,
+                    "image_ids": ok_ids,
+                    "verdicts": {i: verdict for i in ok_ids},
+                })
+            _RECENT_GROUPS[:] = _RECENT_GROUPS[:100]
+
+        return self._send_json({
+            "ok": True,
+            "total": len(image_ids),
+            "succeeded": succeeded,
+            "failed": failed,
+            "as_reviewer": as_reviewer,
+            "as_owner": as_owner,
+            # 未分配给任何质检员的图：已提交，但质检平台任何质检员页签都不会显示它们
+            "unassigned": [i for i in buckets.get("", []) if i not in failed_ids],
+            # 归属质检员未内置登录凭据的图：只能用 owner 提交，平台可能不把它算在该质检员名下
+            "no_cred": [i for i in no_cred if i not in failed_ids],
+        })
+
+    # ---- 质检平台批量提交（每张独立 verdict） ----
+    def _handle_qc_submit(self):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+        pid = body.get("pid") or ""
+        uid = body.get("uid") or ""
+        verdicts = body.get("verdicts") or []
+        if not isinstance(verdicts, list) or not verdicts:
+            return self._send_json({"ok": False, "error": "verdicts 为空"}, 400)
+        # 用质检员本人 token 提交，使平台按 token 正确归属质检结果（拿不到则回退 owner）
+        qc_tok = _get_qc_token(uid)
+        succeeded = 0
+        failed = []
+        for v in verdicts:
+            iid = v.get("image_id")
+            verdict = v.get("verdict")
+            reason = v.get("reason") or ""
+            if verdict not in ("pass", "reject"):
+                failed.append({"image_id": iid, "error": "verdict 非法"})
+                continue
+            s, h, raw2 = upstream("POST", "/api/projects/%s/qc" % pid,
+                                  body={"image_id": iid, "verdict": verdict, "reason": reason},
+                                  token=qc_tok)
+            try:
+                d = json.loads(raw2.decode("utf-8"))
+            except Exception:
+                d = {}
+            if s == 200 and d.get("ok"):
+                succeeded += 1
+            else:
+                failed.append({"image_id": iid, "error": d.get("error") or ("HTTP %s" % s)})
+        _clear_cache_keep_stable()
+        # 提交会改变这些图的 qc_status，清掉 annotation 缓存，避免 _reconcile_overrides 读到旧的 pending
+        for v in verdicts:
+            _annotation_cache_drop(pid, v.get("image_id"))
+        # 本地记录最近提交（最新在前）。verdict 用于纠正 /images 状态滞后，
+        # 保留足够多组（100 组≈400 张），避免提交较多后早期纠正丢失、已通过图
+        # 又因快照滞后被当成 pending；「最近提交」页仍只取前 12 张。
+        if succeeded:
+            _RECENT_GROUPS.insert(0, {
+                "ts": time.time(),
+                "pid": pid,
+                "uid": uid,
+                "image_ids": [v.get("image_id") for v in verdicts if v.get("image_id")],
+                "verdicts": {v.get("image_id"): v.get("verdict")
+                             for v in verdicts if v.get("image_id") and v.get("verdict") in ("pass", "reject")},
+            })
+            _RECENT_GROUPS[:] = _RECENT_GROUPS[:100]
+            # 已提交 verdict，保存时的 pending 纠正不再需要
+            sp = _SAVE_PENDING.get(pid)
+            if sp:
+                for v in verdicts:
+                    sp.discard(v.get("image_id"))
+            # 就地更新复核缓存（不清整块）：否则下一次列表请求会对上百张本地纠正
+            # 做全量 /annotation 复核，把并发的「下一张图 / 下一次提交」堵上 2~3 秒
+            failed_ids = {f.get("image_id") for f in failed}
+            note_overrides(pid, uid, {v.get("image_id"): v.get("verdict")
+                                      for v in verdicts
+                                      if v.get("image_id") and v.get("image_id") not in failed_ids})
+        return self._send_json({
+            "ok": True,
+            "total": len(verdicts),
+            "succeeded": succeeded,
+            "failed": failed,
+        })
+
+    # ---- 历史归属修复：用质检员本人 token 重放已 passed/rejected 的 verdict ----
+    def _handle_qc_fix(self):
+        raw = self._read_body()
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return self._send_json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+        pid = body.get("pid") or ""
+        uid = body.get("uid") or ""
+        if not pid or not uid:
+            return self._send_json({"ok": False, "error": "参数非法"}, 400)
+        qc_tok = _get_qc_token(uid)
+        if not qc_tok:
+            return self._send_json({"ok": False, "error": "该质检员未配置登录凭据或登录失败"}, 400)
+        # qc 角色调 /images 只返回自己名下的图（含 qc_status）
+        s, h, raw2 = upstream("GET", "/api/projects/%s/images" % pid, token=qc_tok)
+        try:
+            d = json.loads(raw2.decode("utf-8"))
+        except Exception:
+            d = {}
+        if s != 200:
+            return self._send_json({"ok": False, "error": "拉取名下图片失败 HTTP %s" % s}, 400)
+        images = d.get("images", [])
+        targets = [im.get("image_id") for im in images
+                   if im.get("qc_status") in ("passed", "rejected")]
+        if not targets:
+            return self._send_json({"ok": True, "total": 0, "succeeded": 0, "failed": []})
+
+        status_map = {im.get("image_id"): im.get("qc_status") for im in images}
+        succeeded = 0
+        failed = []
+        def _one(iid):
+            st = status_map.get(iid)
+            verdict = "pass" if st == "passed" else "reject"
+            s2, h2, raw3 = upstream("POST", "/api/projects/%s/qc" % pid,
+                                    body={"image_id": iid, "verdict": verdict, "reason": ""},
+                                    token=qc_tok)
+            try:
+                dd = json.loads(raw3.decode("utf-8"))
+            except Exception:
+                dd = {}
+            return iid, (s2 == 200 and dd.get("ok"))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            for iid, ok in ex.map(_one, targets):
+                if ok:
+                    succeeded += 1
+                else:
+                    failed.append(iid)
+        return self._send_json({
+            "ok": True,
+            "total": len(targets),
+            "succeeded": succeeded,
+            "failed": failed,
+        })
+
+    # ---- 导出下载 ----
+    def _export(self, pid, mode):
+        query = {"format": "json"}
+        if mode == "passed":
+            query["only"] = "passed"
+        elif mode == "yolo":
+            query["format"] = "yolo"
+        s, h, raw = upstream("GET", "/api/projects/%s/export" % pid, query=query)
+        cd = h.get("Content-Disposition") or ('attachment; filename="%s_%s.zip"' % (pid, mode))
+        return self._send(s, {"Content-Type": h.get("Content-Type", "application/zip"),
+                              "Content-Disposition": cd}, raw)
+
+    # ---- 静态文件 ----
+    def _serve_static(self, path):
+        if path == "/":
+            path = "/login.html" if RELEASE_MODE else "/index.html"
+        elif path == "/qc":
+            path = "/qc.html"
+        elif path == "/anno":
+            path = "/anno.html"
+        elif RELEASE_MODE and path == "/index.html":
+            # 发布版没有数据看板（见文件头注释），直接挡掉，别让人从 URL 摸进来
+            return self._send_json({"ok": False, "error": "发布版不提供数据看板"}, 404)
+        rel = path[len("/static/"):] if path.startswith("/static/") else path.lstrip("/")
+        fp = os.path.normpath(os.path.join(STATIC_DIR, rel))
+        # 边界用 commonpath 判，比 startswith 严：startswith 会放行 staticX/ 这种"同前缀"目录
+        try:
+            inside = os.path.commonpath([fp, STATIC_DIR]) == STATIC_DIR
+        except ValueError:
+            inside = False   # 不同盘符等异常情况一律拒绝
+        if not inside or not os.path.isfile(fp):
+            return self._send_json({"ok": False, "error": "文件不存在"}, 404)
+        ext = os.path.splitext(fp)[1].lower().lstrip(".")
+        ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
+                 "css": "text/css; charset=utf-8", "png": "image/png", "jpg": "image/jpeg",
+                 "jpeg": "image/jpeg", "svg": "image/svg+xml", "json": "application/json"}.get(ext, "application/octet-stream")
+        with open(fp, "rb") as f:
+            body = f.read()
+        if ext == "html":
+            # 静态资源带版本指纹（?v=__VERSION__），发版后 URL 变化，浏览器/代理不会再用旧 JS/CSS
+            body = body.replace(b"__VERSION__", VERSION.encode("utf-8"))
+        return self._send(200, {"Content-Type": ctype,
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                                "Pragma": "no-cache", "Expires": "0"}, body)
+
+    @staticmethod
+    def _pick_headers(h):
+        out = {}
+        if h.get("Content-Type"):
+            out["Content-Type"] = h["Content-Type"]
+        if h.get("Content-Disposition"):
+            out["Content-Disposition"] = h["Content-Disposition"]
+        out["Cache-Control"] = "no-store"   # 透传的动态数据一律不缓存，避免刷新拿到旧值
+        return out
+
+
+def _tray_image():
+    if getattr(sys, "frozen", False):
+        p = os.path.join(getattr(sys, "_MEIPASS", HERE), "label-auto.ico")
+    else:
+        p = os.path.join(HERE, "label-auto.ico")
+    return Image.open(p)
+
+
+def _run_tray(httpd, url):
+    """启动托盘；成功返回 True，失败（缺依赖/图标）返回 False，由调用方回退 serve_forever。"""
+    try:
+        icon = pystray.Icon(
+            "label_auto",
+            _tray_image(),
+            "Label Auto",
+            pystray.Menu(
+                pystray.MenuItem("打开平台", lambda icon, item: webbrowser.open(url)),
+                pystray.MenuItem("退出", lambda icon, item: icon.stop()),
+            ),
+        )
+    except Exception:
+        return False
+    icon.run()
+    httpd.shutdown()
+    return True
+
+
+# ======================================================================
+# 发布版自更新（每 2 分钟检查一次）
+# ======================================================================
+def _version_tuple(v):
+    parts = re.findall(r"\d+", str(v or ""))
+    return tuple(int(x) for x in parts) or (0,)
+
+
+def _sha256_file(path):
+    """分块算 SHA-256，返回小写 hex（大文件不整块读进内存）"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# 更新信息缓存：页面查询（GET /api/update）与后台轮询共用，避免每次都去拉代理。
+# 60 秒一轮，发版后能在一分钟内发现；多个源是并发探测的，不会因此变慢。
+UPDATE_CHECK_TTL = 60      # 秒
+
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_INFO = {"ts": 0.0, "latest": "", "url": "", "sha256": "", "notes": "",
+                "has_update": False, "refreshing": False}
+
+
+def _fetch_manifest(url):
+    """取一个更新源并解析 JSON；失败返回 None。"""
+    sep = "&" if "?" in url else "?"
+    bust = url + sep + "_=" + str(int(time.time()))
+    try:
+        req = urllib.request.Request(bust, headers={
+            "User-Agent": "label-auto-updater",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
+        d = json.loads(urllib.request.urlopen(req, timeout=UPDATE_PROBE_TIMEOUT).read().decode("utf-8"))
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _fetch_update_info():
+    """并发请求所有更新源，取成功响应里版本最高的一份；全部不通返回 None。"""
+    best = None   # (version_tuple, latest, data)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(UPDATE_URLS)) as ex:
+        for d in ex.map(_fetch_manifest, UPDATE_URLS):
+            if not d:
+                continue
+            latest = d.get("version") or ""
+            vt = _version_tuple(latest)
+            if best is None or vt > best[0]:
+                best = (vt, latest, d)
+    if best is None:
+        return None
+    latest, d = best[1], best[2]
+    # 按构建选包：Admin 必须拿 Admin 包，否则会把管理员版替换成员工版
+    if RELEASE_MODE:
+        url = d.get("download_url") or ""
+        sha = (d.get("sha256") or "").strip().lower()
+    else:
+        url = d.get("download_url_admin") or ""
+        sha = (d.get("sha256_admin") or "").strip().lower()
+    return {"latest": latest,
+            "url": url,
+            "sha256": sha,
+            "notes": d.get("notes") or "",
+            # 信息不全就当作没有更新（fail-closed），避免下载错包或跳过校验
+            "has_update": (_version_tuple(latest) > _version_tuple(VERSION)
+                           and bool(url) and len(sha) == 64)}
+
+
+def _refresh_update_info():
+    """拉一次并写进缓存；拉不到也记时间戳（避免每个请求都去重试）。"""
+    info = _fetch_update_info()
+    with _UPDATE_LOCK:
+        if info is not None:
+            _UPDATE_INFO.update({"latest": info["latest"], "url": info["url"],
+                                 "sha256": info["sha256"], "notes": info["notes"],
+                                 "has_update": info["has_update"]})
+        _UPDATE_INFO["ts"] = time.time()
+        _UPDATE_INFO["refreshing"] = False
+    return info
+
+
+def update_status():
+    """给页面用的更新状态。
+
+    缓存过期时**先返回旧值**，同时在后台线程里刷新 —— 不能让页面等 15s 的上游超时。
+    """
+    with _UPDATE_LOCK:
+        info = dict(_UPDATE_INFO)
+    if time.time() - info["ts"] > UPDATE_CHECK_TTL and not info["refreshing"]:
+        with _UPDATE_LOCK:
+            _UPDATE_INFO["refreshing"] = True
+        threading.Thread(target=_refresh_update_info, daemon=True).start()
+    return info
+
+
+def _check_update():
+    """后台轮询（每 60 秒）用：有新版本就直接更新，不再询问用户。
+
+    下载过程仍然显示进度条；信息不全（缺 url / sha256）时静默跳过。
+    """
+    info = _refresh_update_info()
+    if not info or not info["has_update"]:
+        return
+    if not info["url"] or len(info["sha256"]) != 64:
+        return
+    _do_update(info["url"], info["sha256"], silent=True)
+
+
+def _msgbox(title, text, flags=0):
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, str(text), str(title), flags)
+    except Exception:
+        pass
+
+
+def _remove_quiet(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+def _cleanup_download_parts(dest):
+    for i in range(DOWNLOAD_PARTS):
+        _remove_quiet(dest + ".part%d" % i)
+
+
+def _asset_candidates(url):
+    """把直连地址展开成「镜像 + 直连」候选列表。"""
+    out = []
+    if not url:
+        return out
+    for prefix in DOWNLOAD_MIRRORS:
+        u = prefix + url
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def _probe_download_url(url):
+    """Range 探测一条线路（顺便测速），返回 {url, ranges, total, bps}；不可用返回 None。"""
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "label-auto-updater",
+            "Range": "bytes=0-%d" % (DOWNLOAD_PROBE_BYTES - 1),
+        })
+        r = urllib.request.urlopen(req, timeout=UPDATE_PROBE_TIMEOUT)
+        try:
+            got = r.read(DOWNLOAD_PROBE_BYTES)
+            status = r.status
+            cr = r.headers.get("Content-Range") or ""
+            total = 0
+            if cr and "/" in cr:
+                try:
+                    total = int(cr.rsplit("/", 1)[1])
+                except ValueError:
+                    total = 0
+            if not total and status == 200:
+                total = int(r.headers.get("Content-Length") or 0)
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        if status not in (200, 206):
+            return None
+        ms = max(time.time() - t0, 0.001)
+        return {"url": url, "ranges": status == 206 and total > 0,
+                "total": total, "bps": len(got) / ms}
+    except Exception:
+        return None
+
+
+def _probe_download(url):
+    """并发探测所有候选线路，按实测速度从快到慢排序。"""
+    cands = _asset_candidates(url)
+    if not cands:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(cands)) as ex:
+        results = [r for r in ex.map(_probe_download_url, cands) if r]
+    results.sort(key=lambda r: -r["bps"])
+    return results
+
+
+def _download_single(url, dest, progress):
+    req = urllib.request.Request(url, headers={"User-Agent": "label-auto-updater"})
+    resp = urllib.request.urlopen(req, timeout=300)
+    total = int(resp.headers.get("Content-Length") or 0)
+    done = 0
+    with open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            progress(done, total)
+    if total and done != total:
+        raise RuntimeError("下载不完整（%d/%d 字节）" % (done, total))
+
+
+def _download_ranged_multi(cands, total, dest, progress):
+    """分段并发下载：分段轮流分配到不同镜像，某分段失败自动换镜像重试。
+
+    cands 是按速度排好序的候选列表；全部镜像都失败才抛异常（调用方回退单线程）。
+    """
+    n = min(DOWNLOAD_PARTS, max(len(cands) * 2, 4))
+    size = total // n
+    ranges = []
+    for i in range(n):
+        start = i * size
+        end = total - 1 if i == n - 1 else (i + 1) * size - 1
+        ranges.append((start, end))
+    lock = threading.Lock()
+    state = {"done": 0}
+    errors = []
+
+    def one(idx, start, end):
+        part = dest + ".part%d" % idx
+        last = None
+        # 第 idx 段从第 idx 快的线路开始（把负载摊到各镜像），
+        # 失败再按速度顺序换下一条；全部失败才报错
+        order = cands[idx % len(cands):] + cands[:idx % len(cands)]
+        for cand in order:
+            try:
+                req = urllib.request.Request(cand["url"], headers={
+                    "User-Agent": "label-auto-updater",
+                    "Range": "bytes=%d-%d" % (start, end),
+                })
+                resp = urllib.request.urlopen(req, timeout=300)
+                if resp.status != 206:
+                    raise RuntimeError("线路不支持分段（HTTP %s）" % resp.status)
+                with open(part, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        with lock:
+                            state["done"] += len(chunk)
+                            cur = state["done"]
+                        progress(cur, total)
+                if os.path.getsize(part) != end - start + 1:
+                    raise RuntimeError("分段长度不对（%d/%d）" % (os.path.getsize(part), end - start + 1))
+                return
+            except Exception as e:
+                last = e
+                _remove_quiet(part)   # 换镜像重下这一段
+        if last is not None:
+            errors.append(last)
+
+    threads = [threading.Thread(target=one, args=(i, s, e), daemon=True)
+               for i, (s, e) in enumerate(ranges)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    with open(dest, "wb") as out:
+        for i in range(n):
+            with open(dest + ".part%d" % i, "rb") as f:
+                shutil.copyfileobj(f, out, 1 << 20)
+    _cleanup_download_parts(dest)
+    if os.path.getsize(dest) != total:
+        raise RuntimeError("合并后大小不对（%d/%d）" % (os.path.getsize(dest), total))
+
+
+def _download_fast(url, dest, progress):
+    """多线路择优 + 分段并发（分段跨镜像分配）；全部失败返回 (False, error)。"""
+    _remove_quiet(dest)
+    _cleanup_download_parts(dest)
+    probed = _probe_download(url)
+    if not probed:
+        return False, "没有可用的下载线路"
+    total = max(r["total"] for r in probed)
+    range_cands = [c for c in probed if c["ranges"] and c["total"]]
+    last = "下载失败"
+    if range_cands and total >= DOWNLOAD_RANGE_MIN:
+        try:
+            _download_ranged_multi(range_cands, total, dest, progress)
+            return True, None
+        except Exception as e:
+            last = e
+            _remove_quiet(dest)
+            _cleanup_download_parts(dest)
+    # 回退：按测速顺序逐条线路单线程下载
+    for cand in probed:
+        try:
+            _download_single(cand["url"], dest, progress)
+            return True, None
+        except Exception as e:
+            last = e
+            _remove_quiet(dest)
+            _cleanup_download_parts(dest)
+            continue
+    return False, last
+
+
+def _download_with_progress(url, new_path):
+    """多线路 / 分段下载新版本，显示进度条；返回 (ok, error)。"""
+    import tkinter as tk
+    from tkinter import ttk
+    import queue
+
+    q = queue.Queue()
+
+    def _worker():
+        try:
+            ok, err = _download_fast(
+                url, new_path,
+                lambda done, total: q.put(("progress", done, total)))
+            q.put(("done", ok, err))
+        except Exception as e:
+            q.put(("done", False, e))
+
+    root = tk.Tk()
+    root.title("更新")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+    label = tk.Label(root, text="正在下载更新…", width=26)
+    label.pack(padx=24, pady=(16, 8))
+    progress = ttk.Progressbar(root, length=380, mode="determinate")
+    progress.pack(padx=24, pady=(0, 16))
+    root.update_idletasks()
+    w = root.winfo_reqwidth()
+    h = root.winfo_reqheight()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry("+%d+%d" % (x, y))
+
+    final = {"ok": False, "error": None}
+
+    def _poll():
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "progress":
+                    _, done, total = msg
+                    if total:
+                        progress.configure(maximum=total)
+                        progress.configure(value=done)
+                        label.configure(text="正在下载更新… %d%%" % int(done * 100 / total))
+                elif msg[0] == "done":
+                    _, ok, err = msg
+                    final["ok"] = ok
+                    final["error"] = err
+                    root.destroy()
+                    return
+        except queue.Empty:
+            pass
+        root.after(60, _poll)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    root.after(60, _poll)
+    root.mainloop()
+    return final["ok"], final["error"]
+
+
+def _do_update(url, expect_sha, silent=False):
+    """下载并替换 exe。silent=True（后台自动更新）时不弹任何错误框。"""
+    def _fail(title, text):
+        if not silent:
+            _msgbox(title, text, 0x10)  # MB_ICONERROR
+
+    try:
+        exe_path = sys.executable
+        new_path = exe_path + ".new"
+        ok, err = _download_with_progress(url, new_path)
+        if not ok:
+            _remove_quiet(new_path)
+            _cleanup_download_parts(new_path)
+            _fail("更新失败", "下载新版本失败：\n%s" % err)
+            return
+        # 校验下载到的文件，不通过就删掉半成品、绝不替换
+        got = _sha256_file(new_path)
+        if got.lower() != (expect_sha or "").lower():
+            _remove_quiet(new_path)
+            _cleanup_download_parts(new_path)
+            _fail("更新失败",
+                  "下载到的文件校验不通过，已放弃本次更新（旧版本未受影响）。\n\n"
+                  "期望 %s…\n实际 %s…" % (str(expect_sha)[:12], got[:12]))
+            return
+        # 替换前把当前 exe 备份成 .old：新版本万一启动不了，旁边的 .old 就是上一版可用文件
+        try:
+            shutil.copy2(exe_path, exe_path + ".old")
+        except Exception:
+            pass
+        # 写「安装完成」标记，新版本启动时据此提示
+        try:
+            with open(exe_path + ".updated", "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception:
+            pass
+        # 替换脚本：路径经参数传入（%~1/%~2），bat 本身纯 ASCII，避免中文路径乱码
+        bat = exe_path + ".update.bat"
+        with open(bat, "w", encoding="ascii") as f:
+            f.write('@echo off\n')
+            f.write('timeout /t 3 /nobreak >nul\n')
+            f.write('move /y "%~1" "%~2"\n')
+            f.write('if errorlevel 1 goto fail\n')
+            f.write('set PYINSTALLER_RESET_ENVIRONMENT=1\n')
+            f.write('start "" "%~2"\n')
+            f.write('del "%~f0"\n')
+            f.write('exit\n')
+            f.write(':fail\n')
+            f.write('del "%~f0"\n')
+        import subprocess
+        # DETACHED_PROCESS：bat 在后台静默执行，不闪黑窗
+        subprocess.Popen(['cmd.exe', '/c', bat, new_path, exe_path], creationflags=0x00000008)
+        os._exit(0)
+    except Exception as e:
+        _fail("更新失败", str(e))
+
+
+def _update_loop():
+    while True:
+        try:
+            _check_update()
+        except Exception:
+            # 任何异常都不能让后台线程退出，否则只能重启程序才会再检查更新
+            pass
+        time.sleep(UPDATE_CHECK_TTL)
+
+
+def _warm_up():
+    """预热最重的 /api/projects（实测 4.5~7s）。
+
+    否则冷启动后第一个列表请求要干等 5~7 秒 —— 浏览器是启动后 0.6s 打开的，
+    那时候预热已经在飞，用户第一眼基本就是缓存命中。
+    """
+    try:
+        get_projects()
+    except Exception:
+        pass
+
+
+def _cleanup_update_leftovers():
+    """启动时清掉上次更新中断留下的半成品（只由单实例持有者调用）。"""
+    exe = sys.executable
+    _remove_quiet(exe + ".new")
+    _remove_quiet(exe + ".update.bat")
+    for i in range(DOWNLOAD_PARTS):
+        _remove_quiet(exe + ".new.part%d" % i)
+
+
+def _maybe_show_updated_notice():
+    """更新完成后的首次启动：清理标记文件与 .old 备份。
+
+    自动更新是静默的（不弹「已更新」提示，否则每次更新后都要用户点一下）。
+    能执行到这里就说明新版本已经正常启动，所以上一版的 .old 备份不再需要。
+    """
+    try:
+        flag = sys.executable + ".updated"
+        if os.path.exists(flag):
+            try:
+                os.remove(flag)
+            except Exception:
+                pass
+            old = sys.executable + ".old"
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# ---------- 单实例 ----------
+_SINGLE_INSTANCE_MUTEX = None   # 持有互斥体句柄，保证它活到进程结束
+
+
+def _single_instance_guard():
+    """首次启动返回 True；已有同名实例在跑返回 False。
+
+    互斥体名按构建区分，所以 dev 与 release 可以同时开，但同一个 exe 只能开一个。
+    非 Windows 或 API 不可用时一律返回 True —— 不因为环境问题把程序拦死。
+    """
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        name = "Local\\label-auto-%s" % ("release" if RELEASE_MODE else "dev")
+        _SINGLE_INSTANCE_MUTEX = k32.CreateMutexW(None, False, name)
+        return k32.GetLastError() != 183   # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
+def _find_running_url():
+    """已在运行实例的页面地址；扫不到返回 None（只认 /api/config 返回 200 的端口）"""
+    for p in range(PORT_START, PORT_START + 30):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/config" % p, timeout=0.6) as r:
+                if r.status == 200:
+                    return "http://127.0.0.1:%d/qc" % p
+        except Exception:
+            continue
+    return None
+
+
+def main():
+    # 单实例：重复双击不再产生多个进程/多个托盘；已有实例就打开它的页面然后退出
+    if not _single_instance_guard():
+        url = _find_running_url()
+        if url:
+            webbrowser.open(url)
+        else:
+            _msgbox("已在运行", "程序已经在运行了（请看系统托盘）。", 0x40)  # MB_ICONINFORMATION
+        return
+    _cleanup_update_leftovers()
+    _maybe_show_updated_notice()
+    httpd = None
+    port = PORT_START
+    for p in range(PORT_START, PORT_START + 30):
+        try:
+            # 绑定所有网卡，支持局域网访问
+            httpd = http.server.ThreadingHTTPServer(("0.0.0.0", p), Handler)
+            port = p
+            break
+        except OSError:
+            continue
+    if httpd is None:
+        return
+    base = "http://127.0.0.1:%d" % port
+    url = base + "/qc"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    if getattr(sys, "frozen", False):
+        # 只有 exe 才有自我替换的意义；python 直跑时别去替换 python.exe
+        threading.Thread(target=_update_loop, daemon=True).start()
+    # 预热最重的 /api/projects，免得用户打开页面后第一个请求要干等 5~7 秒
+    threading.Thread(target=_warm_up, daemon=True).start()
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if not _run_tray(httpd, url):
+        # 托盘不可用时回退：阻塞服务（Ctrl+C 或任务管理器结束）
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()

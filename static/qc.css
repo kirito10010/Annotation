@@ -1,0 +1,249 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  display: flex;
+  flex-direction: column;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #f4f5f7;
+  color: #222;
+}
+
+/* 顶栏 */
+.qc-topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  background: #fff;
+  border-bottom: 1px solid #e3e6ea;
+  flex-wrap: wrap;
+}
+.qc-title { font-weight: 700; font-size: 16px; }
+.qc-field { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }
+.qc-field select {
+  padding: 4px 8px; border: 1px solid #ccd2d9; border-radius: 6px;
+  min-width: 160px; font-size: 13px;
+}
+.qc-counts { font-size: 12px; color: #888; }
+/* 质检量：平时是一个紧凑模块（标题 + 今天数量），鼠标悬浮才展开每日明细 */
+.qc-daily-stats { position: relative; flex: none; }
+.qc-daily-stats .ds-module {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; border: 1px solid #ccd2d9; border-radius: 6px;
+  background: #fff; font-size: 12px; color: #555; white-space: nowrap; cursor: default;
+}
+.qc-daily-stats .ds-module .ds-title { color: #888; }
+.qc-daily-stats .ds-module .ds-num { font-weight: 600; color: #333; }
+.qc-daily-stats .ds-pop {
+  display: none; position: absolute; top: 100%; right: 0; z-index: 60; margin-top: 4px;
+  padding: 8px 10px; background: #fff; border: 1px solid #ccd2d9; border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.12); font-size: 12px; white-space: nowrap;
+}
+.qc-daily-stats .ds-module:hover .ds-pop { display: block; }
+.qc-daily-stats .ds-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.qc-daily-stats .ds-row + .ds-row { margin-top: 3px; }
+.qc-daily-stats .ds-row .ds-day { color: #999; }
+.qc-daily-stats .ds-row .ds-num { font-weight: 600; color: #333; }
+.qc-spacer { flex: 1; }
+
+.btn {
+  padding: 8px 16px; border: 1px solid #ccd2d9; border-radius: 6px;
+  background: #fff; cursor: pointer; font-size: 13px; color: #222;
+}
+.btn.primary { background: #2b6de8; color: #fff; border-color: #2b6de8; }
+.btn.primary:disabled { background: #a9c2f0; border-color: #a9c2f0; cursor: not-allowed; }
+.btn.success { background: #19a974; color: #fff; border-color: #19a974; }
+.btn.success:disabled { background: #b7e0d0; border-color: #b7e0d0; cursor: not-allowed; }
+.btn.danger { background: #e5484d; color: #fff; border-color: #e5484d; }
+.btn.danger:disabled { background: #f3b9bb; border-color: #f3b9bb; cursor: not-allowed; }
+.link-btn { text-decoration: none; display: inline-flex; align-items: center; }
+.hint { font-size: 12px; color: #888; }
+
+/* 三栏工作区 */
+.qc-workspace {
+  flex: 1; min-height: 0; display: flex; gap: 8px; padding: 8px;
+}
+.qc-side {
+  flex: none; width: 200px; display: flex; flex-direction: column; gap: 10px;
+  background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 10px; overflow-y: auto;
+}
+.qc-cats { display: flex; flex-direction: column; gap: 8px; }
+.cat-btn {
+  position: relative; padding: 9px 10px; border-radius: 6px; font-size: 13px;
+  background: #f4f5f7; color: #222; border: 1px solid #d7dbe0; cursor: pointer; text-align: left;
+}
+.cat-btn:hover { background: #eef0f3; }
+.cat-btn.active { background: #2b6de8; color: #fff; border-color: #2b6de8; }
+.cat-key {
+  position: absolute; top: 4px; right: 6px; min-width: 14px; height: 14px; padding: 0 3px;
+  background: rgba(0,0,0,0.15); border-radius: 3px; font-size: 10px; line-height: 14px; text-align: center;
+}
+.cat-btn.active .cat-key { background: rgba(255,255,255,0.3); }
+.qc-hint { font-size: 12px; color: #888; }
+
+.qc-main { flex: 1; min-width: 0; display: flex; position: relative; background: #000; border-radius: 6px; overflow: hidden; }
+
+/* 照片区右下角：当前版本 + 更新按钮。
+   pointer-events: none 是关键 —— 卡片压在照片上，不能挡住这个角落的画框/右键平移；
+   只有按钮自己恢复 auto 可点。 */
+.qc-version {
+  position: absolute; right: 10px; bottom: 10px; z-index: 30;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  padding: 6px 8px; border-radius: 8px;
+  background: rgba(0,0,0,0.45); color: #e6e8ea; font-size: 12px;
+  pointer-events: none;
+}
+.qc-version:empty { display: none; }
+.qc-version .ver-now { font-weight: 600; }
+.qc-version .ver-hint { color: #ffd479; }
+.qc-version .ver-btn {
+  pointer-events: auto;
+  padding: 2px 8px; font-size: 12px; line-height: 18px;
+  color: #fff; background: #2b6de8; border: 1px solid #2b6de8; border-radius: 4px; cursor: pointer;
+}
+.qc-version .ver-btn:disabled { background: #6b7280; border-color: #6b7280; cursor: not-allowed; }
+
+.qc-list-panel {
+  flex: none; width: 280px; display: flex; flex-direction: column; gap: 8px;
+  background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 10px; min-height: 0;
+}
+.qc-list-tabs { display: flex; gap: 6px; }
+/* 两列网格：搜索框与属性筛选各占一整行，两个下拉各占半行。
+   以前用 flex + wrap，两个 select 的固有宽度（取最长选项）会把 flex:1 的搜索框挤到几乎看不见。
+   注意必须用 > 子选择器：.qc-filters input 会把属性下拉里的 checkbox 一起匹配，
+   width:100% 会把复选框拉满整行。 */
+.qc-filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.qc-filters > input,
+.qc-filters > .label-picker { grid-column: 1 / -1; }
+.qc-filters > input,
+.qc-filters > select { width: 100%; min-width: 0; box-sizing: border-box; }
+.qc-filters > input {
+  padding: 6px 8px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 13px;
+}
+.qc-filters > select {
+  padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
+}
+.qc-filters .label-picker { position: relative; }
+.label-picker-field {
+  border: 1px solid #ccd2d9; border-radius: 6px; padding: 5px 8px; cursor: pointer;
+  min-height: 16px; background: #fff; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-size: 12px;
+}
+.label-picker-field .placeholder { color: #9ca3af; }
+.label-picker-tag {
+  display: inline-block; background: #e0e7ff; color: #3730a3; border-radius: 4px;
+  padding: 1px 7px; margin: 1px 3px 1px 0; font-size: 12px;
+}
+.label-picker-more {
+  background: #e5e7eb; color: #6b7280;
+}
+.label-picker-dropdown {
+  position: absolute; top: 100%; right: 0; z-index: 50; background: #fff;
+  border: 1px solid #ccd2d9; border-radius: 6px; max-height: 260px; overflow: auto;
+  width: 100%; min-width: 0; box-shadow: 0 4px 14px rgba(0,0,0,0.12); margin-top: 2px;
+}
+.label-picker-option {
+  display: flex; align-items: center; justify-content: flex-start; gap: 8px;
+  padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  width: 100%; box-sizing: border-box; text-align: left;
+}
+.label-picker-option:hover { background: #f1f5f9; }
+.label-picker-option input { flex: none; cursor: pointer; }
+.qc-tab {
+  flex: 1; padding: 6px 10px; border: 1px solid #ccd2d9; border-radius: 6px;
+  background: #fff; cursor: pointer; font-size: 13px; position: relative;
+}
+.qc-tab.active { background: #2b6de8; color: #fff; border-color: #2b6de8; }
+.qc-badge {
+  position: absolute; top: -6px; right: -6px;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 8px; color: #fff;
+  font-size: 11px; line-height: 16px; text-align: center;
+  font-weight: 600; pointer-events: none;
+}
+#badgePending { background: #f59e0b; }
+#badgePassed { background: #19a974; }
+#badgeRejected { background: #e5484d; }
+.qc-list-items { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+.qc-item {
+  padding: 10px 12px; border: 1px solid #e3e6ea; border-radius: 8px; font-size: 13px;
+  line-height: 1.5; cursor: pointer; min-height: 42px; flex-shrink: 0;
+}
+/* 注意：不要给 .qc-item 加 content-visibility / contain-intrinsic-size。
+   那会让离屏项只按"估算高度"占位，而项的真实高度有两种（有/无「标注：某某」那行），
+   于是列表总高度是估算值、拖动时又随渲染不断变化 → 滚动条"拖到哪不是哪"、thumb 还会变短。
+   作业平台的 .anno-item 从来没有这两个属性，所以它是准的。 */
+.qc-item:hover { background: #f4f5f7; }
+.qc-item.active { background: #e6effc; border-color: #2b6de8; }
+.qc-ann-tag { font-size: 11px; color: #888; margin-top: 3px; }
+.qc-item-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.qc-item-name {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.qc-box-count {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; color: #2b6de8; background: #e6effc;
+  border-radius: 10px;
+}
+.qc-copy-btn {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; line-height: 18px;
+  color: #2b6de8; background: #fff;
+  border: 1px solid #ccd2d9; border-radius: 4px; cursor: pointer;
+}
+.qc-copy-btn:hover { background: #e6effc; }
+
+.empty { padding: 40px; text-align: center; color: #999; }
+/* 没有图可显示时，别再留一块纯黑让人以为「一直在加载」 */
+.viewer .empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 24px;
+  background: #23272e; color: #b8bec7;
+}
+/* 空列表的「为什么空」说明 + 可点的操作 */
+.empty-sub { margin-top: 6px; font-size: 12px; line-height: 1.6; color: #8a919b; }
+.empty-action { margin-top: 10px; }
+.empty-action .btn { margin: 0 4px; }
+
+/* 图片查看器（缩放平移 + 框叠加） */
+.viewer { position: relative; width: 100%; height: 100%; overflow: hidden; cursor: crosshair; background: #000; }
+.viewer.full { flex: 1; }
+.stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+.stage img { display: block; user-select: none; -webkit-user-drag: none; }
+.viewer .overlay { position: absolute; inset: 0; pointer-events: none; }
+
+/* 快捷键设置 / 登录弹窗 */
+.settings {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+  display: flex; align-items: center; justify-content: center; z-index: 150;
+}
+.settings-box {
+  background: #fff; border-radius: 8px; width: 360px; max-height: 80vh; overflow-y: auto;
+  padding: 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.2);
+}
+.settings-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; }
+.settings-close { background: none; border: none; font-size: 22px; cursor: pointer; line-height: 1; color: #888; }
+.settings-body { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+.settings-body label { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #333; }
+.key-input {
+  width: 70px; text-align: center; padding: 6px; border: 1px solid #ccd2d9;
+  border-radius: 6px; cursor: pointer; font-size: 14px; background: #fafbfc;
+}
+.key-input:focus { outline: 2px solid #2b6de8; background: #fff; }
+.settings-foot { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: rgba(0,0,0,0.8); color: #fff; padding: 8px 16px; border-radius: 6px;
+  font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 200;
+}
+.toast.show { opacity: 1; }
+
+.hidden { display: none !important; }
