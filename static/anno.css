@@ -58,9 +58,13 @@ body {
 .cat-btn {
   position: relative; padding: 9px 10px; border-radius: 6px; font-size: 13px;
   background: #f4f5f7; color: #222; border: 1px solid #d7dbe0; cursor: pointer; text-align: left;
+  transition: box-shadow .15s ease, background .15s ease, border-color .15s ease;
 }
 .cat-btn:hover { background: #eef0f3; }
-.cat-btn.active { background: #2b6de8; color: #fff; border-color: #2b6de8; }
+.cat-btn.active {
+  background: #2b6de8; color: #fff; border-color: #2b6de8;
+  box-shadow: 0 0 0 2px rgba(43, 109, 232, 0.35), 0 0 10px rgba(43, 109, 232, 0.75);
+}
 .cat-key {
   position: absolute; top: 4px; right: 6px; min-width: 14px; height: 14px; padding: 0 3px;
   background: rgba(0,0,0,0.15); border-radius: 3px; font-size: 10px; line-height: 14px; text-align: center;
@@ -83,6 +87,16 @@ body {
 }
 .anno-version:empty { display: none; }
 .anno-version .ver-now { font-weight: 600; }
+.anno-version .ver-online { color: #9fe3a1; }
+/* 照片右上角：几乎重合的框提示。pointer-events:none 保证不挡画框/右键平移 */
+.overlap-warn {
+  position: absolute; top: 10px; right: 10px; z-index: 40;
+  max-width: 70%; padding: 5px 9px; border-radius: 6px;
+  background: rgba(190, 38, 38, 0.9); color: #fff;
+  font-size: 12px; line-height: 1.4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
 .anno-version .ver-hint { color: #ffd479; }
 .anno-version .ver-btn {
   pointer-events: auto;

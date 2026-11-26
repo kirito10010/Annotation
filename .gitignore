@@ -15,6 +15,9 @@ dist/
 *.updated
 *.old
 
+# ---- 启动脚本重定向的输出日志 ----
+server.log
+
 # ---- 发布清单只作为 GitHub Release 资产分发，不进仓库（本地保留用于打包/上传）----
 version.json
 

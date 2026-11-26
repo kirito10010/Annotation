@@ -18,11 +18,9 @@
 
   <nav class="tabs" id="tabs">
     <button data-tab="query" class="active">标签巡检</button>
-    <button data-tab="falsePass">误通过核查</button>
     <button data-tab="monitor">质检看板</button>
     <button data-tab="dist">标签分布</button>
     <button data-tab="search">图片搜索</button>
-    <button data-tab="export">导出</button>
     <button data-tab="fix">归属修复</button>
   </nav>
 
@@ -72,29 +70,22 @@
         <button id="batchPassBtn" class="btn success">批量通过</button>
         <button id="queryExportBtn" class="btn">导出 CSV</button>
       </div>
+      <div class="rule-builder" id="ruleBuilder">
+        <div class="rule-builder-head">
+          <span class="rule-title">缺失校验：</span>
+          <span class="hint">父框存在、但框内一个指定子框都没有 → 筛出（图里没有父框不算问题）</span>
+          <span class="rule-actions">
+            <button id="ruleAddBtn" class="btn">+ 添加规则</button>
+            <button id="ruleClearBtn" class="btn">清空</button>
+          </span>
+        </div>
+        <div class="rule-list" id="ruleList"></div>
+      </div>
       <div class="summary" id="querySummary"></div>
       <div class="table-wrap">
         <table id="queryTable" class="hidden">
           <thead>
-            <tr><th class="ck"><input type="checkbox" id="querySelectAll" title="全选"></th><th>图片</th><th>框坐标 (x,y,w,h)</th><th>状态</th><th>质检员</th><th>质检时间</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- 误通过核查 -->
-    <section id="tab-falsePass" class="tab-panel hidden">
-      <div class="toolbar">
-        <label>禁止出现的标签（逗号分隔）：</label>
-        <input id="fpCats" value="前挡玻璃遮挡" placeholder="前挡玻璃遮挡,车辆遮挡">
-        <button id="fpBtn" class="btn primary">开始核查</button>
-      </div>
-      <div class="summary" id="fpSummary"></div>
-      <div class="table-wrap">
-        <table id="fpTable" class="hidden">
-          <thead>
-            <tr><th>图片</th><th>框坐标 (x,y,w,h)</th><th>质检员</th></tr>
+            <tr><th class="ck"><input type="checkbox" id="querySelectAll" title="全选"></th><th>图片</th><th>框坐标 (x,y,w,h)</th><th>状态</th><th>质检员</th><th>提交身份</th><th>质检时间</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -129,25 +120,11 @@
       <div class="table-wrap">
         <table id="searchTable" class="hidden">
           <thead>
-            <tr><th class="ck"><input type="checkbox" id="searchSelectAll" title="全选"></th><th>图片</th><th>框数</th><th>状态</th><th>质检员</th></tr>
+            <tr><th class="ck"><input type="checkbox" id="searchSelectAll" title="全选"></th><th>图片</th><th>框数</th><th>状态</th><th>质检员</th><th>提交身份</th></tr>
           </thead>
           <tbody></tbody>
         </table>
       </div>
-    </section>
-
-    <!-- 导出 -->
-    <section id="tab-export" class="tab-panel hidden">
-      <div class="toolbar">
-        <label>导出模式：</label>
-        <select id="exportMode">
-          <option value="full">全量 (json)</option>
-          <option value="passed">仅质检通过 (json)</option>
-          <option value="yolo">YOLO 格式</option>
-        </select>
-        <button id="exportBtn" class="btn primary">开始导出</button>
-      </div>
-      <div class="hint">导出会从平台实时生成 zip 并下载到本地。</div>
     </section>
 
     <!-- 归属修复 -->
@@ -169,8 +146,10 @@
         <button id="previewClose" class="icon-btn" title="关闭">×</button>
       </div>
       <div id="previewImageWrap" class="preview-image-wrap">
-        <img id="previewImg" alt="">
-        <canvas id="previewCanvas"></canvas>
+        <div id="previewStage" class="preview-stage">
+          <img id="previewImg" alt="">
+        </div>
+        <svg id="previewSvg" class="preview-boxes" xmlns="http://www.w3.org/2000/svg"></svg>
       </div>
       <div id="previewInfo" class="detail-info">点击图片查看详情</div>
     </div>

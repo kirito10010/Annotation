@@ -9,6 +9,9 @@ const state = {
   categories: [],
   colors: {},
   queryResults: [],
+  queryRuleCount: 0,
+  searchResults: [],
+  rules: [],             // 缺失校验规则：[{ parent: 属性名, children: [属性名...] }]
   qcOwners: [],
   qcReviewers: [],
 };
@@ -92,6 +95,9 @@ async function onProjectChange() {
   // 渲染标签多选下拉（切项目后清空已选标签）
   selectedLabels.clear();
   renderLabelPicker();
+  // 缺失校验规则引用的是上一个项目的属性名，切项目后清空
+  state.rules = [];
+  renderRules();
   // 渲染质检员下拉（来自 monitoring）
   await loadMonitoring();
   // 项目切换后，若当前在「标签分布」页，重新渲染分布
@@ -221,6 +227,110 @@ function updateLabelPickerField() {
     : '<span class="placeholder">选择标签（可多选，留空查全部）</span>';
 }
 
+/* ============ 缺失校验规则 ============ */
+
+// 通用分类多选下拉（规则里的子属性多选用）
+function createCatPicker(initial, onChange) {
+  const wrap = document.createElement('div');
+  wrap.className = 'cat-picker';
+  const field = document.createElement('div');
+  field.className = 'cat-picker-field';
+  const dd = document.createElement('div');
+  dd.className = 'cat-picker-dropdown hidden';
+  const set = new Set(initial || []);
+
+  function renderField() {
+    field.innerHTML = set.size
+      ? Array.from(set).map(c => `<span class="label-picker-tag">${escapeHtml(c)}</span>`).join('')
+      : '<span class="placeholder">选择子属性（可多选）</span>';
+  }
+  function renderDropdown() {
+    dd.innerHTML = '';
+    (state.categories || []).forEach(c => {
+      const lab = document.createElement('label');
+      lab.className = 'label-picker-option';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = set.has(c);
+      cb.onchange = () => {
+        cb.checked ? set.add(c) : set.delete(c);
+        renderField();
+        if (onChange) onChange(Array.from(set));
+      };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(c));
+      dd.appendChild(lab);
+    });
+  }
+
+  field.onclick = e => {
+    e.stopPropagation();
+    if (dd.classList.contains('hidden')) renderDropdown();
+    dd.classList.toggle('hidden');
+  };
+  dd.onclick = e => e.stopPropagation();
+  wrap.appendChild(field);
+  wrap.appendChild(dd);
+  renderField();
+  return { el: wrap, getSelected: () => Array.from(set) };
+}
+
+function renderRules() {
+  const list = $('ruleList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.rules.length) {
+    list.innerHTML = '<div class="rule-empty">未添加规则；点击「+ 添加规则」按父属性做缺失校验。</div>';
+    return;
+  }
+  state.rules.forEach((rule, idx) => {
+    const card = document.createElement('div');
+    card.className = 'rule-card';
+
+    const no = document.createElement('span');
+    no.className = 'rule-no';
+    no.textContent = '规则 ' + (idx + 1);
+
+    const sel = document.createElement('select');
+    sel.className = 'rule-parent';
+    sel.innerHTML = '<option value="">选择父属性</option>' +
+      (state.categories || []).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    sel.value = rule.parent || '';
+    sel.onchange = () => { rule.parent = sel.value; };
+
+    const must = document.createElement('span');
+    must.className = 'rule-label';
+    must.textContent = '框内必须包含任一：';
+
+    const picker = createCatPicker(rule.children, selected => { rule.children = selected; });
+
+    const del = document.createElement('button');
+    del.className = 'btn rule-del';
+    del.title = '删除规则';
+    del.textContent = '×';
+    del.onclick = () => { state.rules.splice(idx, 1); renderRules(); };
+
+    card.appendChild(no);
+    card.appendChild(sel);
+    card.appendChild(must);
+    card.appendChild(picker.el);
+    card.appendChild(del);
+    list.appendChild(card);
+  });
+}
+
+function collectRules() {
+  for (let i = 0; i < state.rules.length; i++) {
+    const r = state.rules[i];
+    if (!r.parent) return { ok: false, error: `规则 ${i + 1} 还没选父属性` };
+    if (!r.children.length) return { ok: false, error: `规则 ${i + 1} 还没选子属性` };
+  }
+  return {
+    ok: true,
+    rules: state.rules.map(r => ({ parent: r.parent, children: r.children.slice() })),
+  };
+}
+
 let _progressTimer = null;
 function startQueryProgress() {
   const summary = $('querySummary');
@@ -249,12 +359,18 @@ async function doQuery() {
   const cat = Array.from(selectedLabels).join(',');
   const sort = $('querySort').value;
   const pm = $('queryPassedMinutes').value;
+  const rc = collectRules();
+  if (!rc.ok) return toast(rc.error);
+  state.queryRuleCount = rc.rules.length;
   const params = [];
   if (cat) params.push('cat=' + encodeURIComponent(cat));
   if (sort) params.push('sort=' + sort);
   if (pm) params.push('passed_minutes=' + pm);
+  if (rc.rules.length) params.push('rules=' + encodeURIComponent(JSON.stringify({ rules: rc.rules })));
   const url = '/api/projects/' + state.currentProjectId + '/query' + (params.length ? '?' + params.join('&') : '');
-  toast(pm ? '查询最近通过的数据…' : (sort ? '按质检时间排序中，请稍候…' : (cat ? '查询中，请稍候…' : '加载全部图片中…')));
+  toast(rc.rules.length
+    ? `缺失校验 ${rc.rules.length} 条规则，查询中…`
+    : (pm ? '查询最近通过的数据…' : (sort ? '按质检时间排序中，请稍候…' : (cat ? '查询中，请稍候…' : '加载全部图片中…'))));
   startQueryProgress();
   let r;
   try {
@@ -276,9 +392,13 @@ function renderQuery(results) {
 
   const totalBoxes = rows.reduce((s, r) => s + (r.box_count != null ? r.box_count : r.boxes.length), 0);
   const unannotated = results.filter(r => r.qc_status === 'unannotated').length;
+  const ruleInfo = state.queryRuleCount
+    ? `，缺失校验 <strong>${state.queryRuleCount}</strong> 条规则`
+    : '';
   $('querySummary').innerHTML =
     `命中 <strong>${results.length}</strong> 张图` +
     (unannotated ? `（未作业 ${unannotated}）` : '') +
+    ruleInfo +
     `，筛选后 <strong>${rows.length}</strong> 张（框数 ${totalBoxes}）`;
   // 未作业的图没有任何人工标注，选标签时必然查不到，说明原因而不是让人以为坏了
   if (status === 'unannotated' && selectedLabels.size && rows.length === 0) {
@@ -296,6 +416,7 @@ function renderQuery(results) {
       `<td>${escapeHtml(r.image_id)}</td><td>${escapeHtml(boxesText(r))}</td>` +
       `<td><span class="badge ${escapeHtml(r.qc_status || 'unknown')}">${statusText(r.qc_status)}</span></td>` +
       `<td>${escapeHtml(r.qc_owner || '-')}</td>` +
+      `<td>${submitIdentityBadge(r)}</td>` +
       `<td>${escapeHtml(r.reviewed_at || '-')}</td>`;
     tr.querySelector('.rowCheck').onclick = e => { e.stopPropagation(); updateQueryCount(); };
     tbody.appendChild(tr);
@@ -304,8 +425,13 @@ function renderQuery(results) {
   updateQueryCount();
 }
 
-/* 框列文案：未作业行没有人工框，显示模型预标注框数 */
+/* 框列文案：缺失校验优先展示违规父框；未作业行没有人工框，显示模型预标注框数 */
 function boxesText(r) {
+  if (r.violations && r.violations.length) {
+    return r.violations.map(v =>
+      `${v.parent}(${v.x},${v.y},${v.w},${v.h}) 缺 ${(v.expected || []).join('/')}`
+    ).join('；');
+  }
   if (r.qc_status === 'unannotated') {
     return r.box_count > 0 ? `预标注 ${r.box_count} 框` : '无标注';
   }
@@ -313,6 +439,34 @@ function boxesText(r) {
     return r.boxes.map(b => `(${b.x},${b.y},${b.w},${b.h})`).join('；');
   }
   return `${r.box_count != null ? r.box_count : r.boxes.length} 框`;
+}
+
+/* 缺失子属性列：违规父框缺哪些子属性（无违规则为空） */
+function violationsText(r) {
+  if (!r.violations || !r.violations.length) return '';
+  return r.violations.map(v => `${v.parent} 缺 ${(v.expected || []).join('/')}`).join('；');
+}
+
+/* 提交身份：这张图批量通过/打回时会用谁的权限 */
+function submitIdentityText(r) {
+  if (!r.submit_as) return '-';
+  if (!r.qc_uid) return `${r.submit_by}（回退·未分配）`;
+  return r.submit_as === 'reviewer' ? `${r.submit_by}（本人）` : `${r.submit_by}（回退）`;
+}
+
+function submitIdentityBadge(r) {
+  if (!r.submit_as) return '-';
+  const cls = !r.qc_uid ? 'submit-none'
+    : (r.submit_as === 'reviewer' ? 'submit-reviewer' : 'submit-owner');
+  return `<span class="badge ${cls}" title="${escapeHtml(r.submit_note || '')}">` +
+    `${escapeHtml(submitIdentityText(r))}</span>`;
+}
+
+/* 选中项里有多少张会以管理员（回退）身份提交 */
+function countOwnerFallback(scope, ids) {
+  const src = scope === '#searchTable' ? state.searchResults : state.queryResults;
+  const set = new Set(ids);
+  return (src || []).filter(r => set.has(r.image_id) && r.submit_as && r.submit_as !== 'reviewer').length;
 }
 
 function getSelectedIds(scope) {
@@ -330,7 +484,11 @@ async function batchQc(scope, verdict, afterFn) {
   if (!ids.length) return toast('请先勾选图片');
   if (!state.currentProjectId) return toast('请先选择项目');
   const act = verdict === 'pass' ? '通过' : '打回';
-  if (!confirm(`确定将 ${ids.length} 张图${act}吗？`)) return;
+  const fallbackN = countOwnerFallback(scope, ids);
+  const extra = fallbackN
+    ? `\n其中 ${fallbackN} 张会以管理员身份提交（归属不会算在质检员名下）`
+    : '';
+  if (!confirm(`确定将 ${ids.length} 张图${act}吗？${extra}`)) return;
   toast(`批量${act}中…`);
   let r;
   try {
@@ -346,8 +504,10 @@ async function batchQc(scope, verdict, afterFn) {
   const failedN = (r.failed && r.failed.length) || 0;
   const unassignedN = (r.unassigned && r.unassigned.length) || 0;
   const noCredN = (r.no_cred && r.no_cred.length) || 0;
+  const asOwnerN = r.as_owner || 0;
   const warn = [];
   if (failedN) warn.push(`失败 ${failedN} 张`);
+  if (asOwnerN) warn.push(`以管理员身份提交 ${asOwnerN} 张`);
   if (unassignedN) warn.push(`${unassignedN} 张未分配质检员（质检平台看不到）`);
   if (noCredN) warn.push(`${noCredN} 张的质检员未内置登录（平台归属可能不对）`);
   toast(`${act}成功 ${r.succeeded} 张` + (warn.length ? `；${warn.join('；')}` : ''));
@@ -366,34 +526,6 @@ function updateSearchCount() {
 
 function statusText(s) {
   return { unannotated: '未作业', passed: '已通过', pending: '待质检', rejected: '已打回' }[s] || s || '未知';
-}
-
-/* ============ 误通过核查 ============ */
-async function doFalsePass() {
-  const cats = $('fpCats').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-  if (!cats.length) return toast('请填写禁止出现的标签');
-  if (!state.currentProjectId) return toast('请先选择项目');
-  toast('核查中…');
-  const r = await api('/api/projects/' + state.currentProjectId + '/false_pass?cats=' + encodeURIComponent(cats.join(',')));
-  if (!r || !r.ok) {
-    $('fpSummary').innerHTML = '';
-    $('fpTable').classList.add('hidden');
-    toast((r && r.error) || '核查失败');
-    return;
-  }
-  const results = r.results || [];
-  $('fpSummary').innerHTML = `含禁止标签且已质检通过的图：<strong>${results.length}</strong> 张`;
-  const tbody = $('fpTable').querySelector('tbody');
-  tbody.innerHTML = '';
-  $('fpTable').classList.toggle('hidden', results.length === 0);
-  results.forEach(r => {
-    const tr = document.createElement('tr');
-    tr.className = 'clickable';
-    tr.onclick = () => openPreview(r.image_id);
-    const boxes = r.boxes.map(b => `(${b.x},${b.y},${b.w},${b.h})`).join('；');
-    tr.innerHTML = `<td>${escapeHtml(r.image_id)}</td><td>${escapeHtml(boxes)}</td><td>${escapeHtml(r.qc_owner || '-')}</td>`;
-    tbody.appendChild(tr);
-  });
 }
 
 /* ============ 质检看板 ============ */
@@ -463,6 +595,7 @@ async function doSearch() {
   const r = await api('/api/projects/' + state.currentProjectId + '/search?q=' + encodeURIComponent(q));
   if (!r || !r.ok) { toast((r && r.error) || '搜索失败'); return; }
   const results = r.results || [];
+  state.searchResults = results;
   $('searchSummary').innerHTML = `匹配 <strong>${results.length}</strong> 张图`;
   const tbody = $('searchTable').querySelector('tbody');
   tbody.innerHTML = '';
@@ -474,7 +607,8 @@ async function doSearch() {
     tr.innerHTML = `<td class="ck"><input type="checkbox" class="rowCheck" data-id="${escapeHtml(x.image_id)}"></td>` +
       `<td>${escapeHtml(x.image_id)}</td><td>${x.box_count ?? '-'}</td>` +
       `<td><span class="badge ${escapeHtml(x.qc_status || 'unknown')}">${statusText(x.qc_status)}</span></td>` +
-      `<td>${escapeHtml(x.qc_owner || '-')}</td>`;
+      `<td>${escapeHtml(x.qc_owner || '-')}</td>` +
+      `<td>${submitIdentityBadge(x)}</td>`;
     tr.querySelector('.rowCheck').onclick = e => { e.stopPropagation(); updateSearchCount(); };
     tbody.appendChild(tr);
   });
@@ -484,10 +618,82 @@ async function doSearch() {
 
 /* ============ 照片详情面板 ============ */
 let detailToken = 0;
+
+// 预览区缩放/平移状态（transform: translate(x,y) scale(s)）
+// baseW/baseH：图片适配 wrap 后的 1× 显示尺寸；boxes：当前图标注（供覆盖层重绘）
+const previewView = {
+  scale: 1, x: 0, y: 0, dragging: false,
+  startX: 0, startY: 0, baseX: 0, baseY: 0,
+  baseW: 0, baseH: 0, boxes: [],
+};
+
+function applyPreviewTransform() {
+  const stage = $('previewStage');
+  if (!stage) return;
+  stage.style.transform =
+    `translate(${previewView.x}px, ${previewView.y}px) scale(${previewView.scale})`;
+  drawPreviewOverlay();   // 覆盖层不参与缩放，按当前变换重绘，保证线宽/字号恒定清晰
+}
+
+function resetPreviewView() {
+  previewView.scale = 1;
+  previewView.x = 0;
+  previewView.y = 0;
+  previewView.dragging = false;
+  const wrap = $('previewImageWrap');
+  if (wrap) wrap.classList.remove('dragging');
+  applyPreviewTransform();
+}
+
+// 滚轮缩放：以鼠标位置为锚点（stage 在 wrap 内 flex 居中，偏移按 wrap 中心计算）
+function onPreviewWheel(e) {
+  e.preventDefault();
+  const wrap = $('previewImageWrap');
+  if (!wrap) return;
+  const rect = wrap.getBoundingClientRect();
+  const cx = e.clientX - rect.left - rect.width / 2;
+  const cy = e.clientY - rect.top - rect.height / 2;
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const next = Math.min(8, Math.max(0.5, previewView.scale * factor));
+  if (next === previewView.scale) return;
+  // 保持鼠标下的画面点不动：p = (c - offset) / scale
+  previewView.x = cx - (cx - previewView.x) * (next / previewView.scale);
+  previewView.y = cy - (cy - previewView.y) * (next / previewView.scale);
+  previewView.scale = next;
+  applyPreviewTransform();
+}
+
+// 拖动平移：mousemove/mouseup 挂在 window，鼠标移出弹窗也不丢
+function onPreviewMouseDown(e) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  previewView.dragging = true;
+  previewView.startX = e.clientX;
+  previewView.startY = e.clientY;
+  previewView.baseX = previewView.x;
+  previewView.baseY = previewView.y;
+  $('previewImageWrap').classList.add('dragging');
+}
+
+function onPreviewMouseMove(e) {
+  if (!previewView.dragging) return;
+  previewView.x = previewView.baseX + (e.clientX - previewView.startX);
+  previewView.y = previewView.baseY + (e.clientY - previewView.startY);
+  applyPreviewTransform();
+}
+
+function onPreviewMouseUp() {
+  if (!previewView.dragging) return;
+  previewView.dragging = false;
+  $('previewImageWrap').classList.remove('dragging');
+}
+
 async function openPreview(imageId) {
   const myToken = ++detailToken;
   const modal = $('previewModal');
   modal.classList.remove('hidden');
+  resetPreviewView();
+  clearPreviewOverlay();
   $('previewTitle').textContent = imageId;
   $('previewInfo').innerHTML = '<div class="row">加载中…</div>';
 
@@ -500,11 +706,18 @@ async function openPreview(imageId) {
       if (myToken !== detailToken) return;
       if (ann && ann.ok && ann.boxes) {
         drawBoxes(img, ann.boxes);
-        const cats = ann.boxes.map(b => b.category + (b.source === 'pre' ? '[预]' : '')).join('、');
+        const chips = ann.boxes.map(b => {
+          const cat = b.category || '';
+          const pre = b.source === 'pre' ? '[预]' : '';
+          return `<span class="label-chip"><span class="dot" style="background:${colorFor(cat)}"></span>` +
+            `<span class="txt">${escapeHtml(cat)}${escapeHtml(pre)}</span></span>`;
+        }).join('');
         $('previewInfo').innerHTML =
-          `<div class="row"><b>状态：</b>${statusText(ann.qc_status)}</div>` +
-          `<div class="row"><b>框数：</b>${ann.boxes.length}</div>` +
-          `<div class="row"><b>标签：</b>${escapeHtml(cats) || '无'}</div>`;
+          `<div class="detail-line"><span class="detail-k">状态</span>` +
+          `<span class="badge ${escapeHtml(ann.qc_status || 'unknown')}">${statusText(ann.qc_status)}</span>` +
+          `<span class="detail-k">框数</span><span class="detail-v">${ann.boxes.length}</span></div>` +
+          `<div class="detail-line"><span class="detail-k">标签</span>` +
+          `<div class="label-chips">${chips || '<span class="detail-v">无</span>'}</div></div>`;
       }
     } catch (e) { /* 忽略 */ }
   };
@@ -521,68 +734,126 @@ function colorFor(cat) {
 
 function closePreview() {
   detailToken++;
+  resetPreviewView();
+  clearPreviewOverlay();
   $('previewTitle').textContent = '照片详情';
   const img = $('previewImg');
   img.onload = img.onerror = null;
   img.removeAttribute('src');
-  const c = $('previewCanvas');
-  c.getContext('2d').clearRect(0, 0, c.width, c.height);
   $('previewInfo').textContent = '点击图片查看详情';
   $('previewModal').classList.add('hidden');
 }
 
-function drawBoxes(img, boxes) {
-  const c = $('previewCanvas');
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function clearSvg(svg) {
+  if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+}
+
+function clearPreviewOverlay() {
+  previewView.boxes = [];
+  previewView.baseW = 0;
+  previewView.baseH = 0;
+  clearSvg($('previewSvg'));
+}
+
+/* 覆盖层文字宽度估算（SVG 无法直接 measureText，CJK 按全角、ASCII 按半角） */
+function previewTextWidth(s, fontSize) {
+  let w = 0;
+  for (const ch of String(s)) w += ch.charCodeAt(0) > 255 ? fontSize : fontSize * 0.55;
+  return w;
+}
+
+/* 按当前缩放/位移重绘标注框。覆盖层固定在 wrap 上、不做 CSS 缩放，
+   因此线宽 2px、字号 13px 恒定，放大后依然锐利（与作业/质检平台一致）。 */
+function drawPreviewOverlay() {
   const wrap = $('previewImageWrap');
+  const svg = $('previewSvg');
+  if (!wrap || !svg) return;
+  const Wc = wrap.clientWidth;
+  const Hc = wrap.clientHeight;
+  if (!Wc || !Hc) return;
+  svg.setAttribute('viewBox', `0 0 ${Wc} ${Hc}`);
+  svg.setAttribute('width', Wc);
+  svg.setAttribute('height', Hc);
+  clearSvg(svg);
+  const { baseW: dw, baseH: dh, scale, x, y, boxes } = previewView;
+  if (!dw || !dh || !boxes || !boxes.length) return;
+  // stage 在 wrap 内居中，缩放原点为中心：屏幕坐标 = 中心 + 位移 + (归一化坐标 - 0.5) * 显示尺寸 * 缩放
+  const ox = Wc / 2 + x - (dw / 2) * scale;
+  const oy = Hc / 2 + y - (dh / 2) * scale;
+  const fontSize = 13;
+  boxes.forEach(b => {
+    const bb = b.bbox || {};
+    if (bb.x1 == null) return;
+    const bx = ox + bb.x1 * dw * scale;
+    const by = oy + bb.y1 * dh * scale;
+    const bw = (bb.x2 - bb.x1) * dw * scale;
+    const bh = (bb.y2 - bb.y1) * dh * scale;
+    if (bx + bw < 0 || by + bh < 0 || bx > Wc || by > Hc) return;   // 屏幕外裁剪
+    const color = colorFor(b.category || '');
+
+    const rect = document.createElementNS(SVG_NS, 'rect');
+    rect.setAttribute('x', bx);
+    rect.setAttribute('y', by);
+    rect.setAttribute('width', Math.max(0, bw));
+    rect.setAttribute('height', Math.max(0, bh));
+    rect.setAttribute('fill', 'none');
+    rect.setAttribute('stroke', color);
+    rect.setAttribute('stroke-width', '2');
+    svg.appendChild(rect);
+
+    const label = `${b.category || ''}${b.source === 'pre' ? ' [预]' : ''}`;
+    const tw = previewTextWidth(label, fontSize);
+    let bgY = by - 4 - fontSize;
+    let textY = by - 4;
+    if (bgY < 0) { bgY = by; textY = by + fontSize; }
+    const bg = document.createElementNS(SVG_NS, 'rect');
+    bg.setAttribute('x', bx);
+    bg.setAttribute('y', bgY);
+    bg.setAttribute('width', tw + 6);
+    bg.setAttribute('height', fontSize + 2);
+    bg.setAttribute('fill', color);
+    svg.appendChild(bg);
+
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('x', bx + 3);
+    text.setAttribute('y', textY);
+    text.setAttribute('font-size', fontSize);
+    text.setAttribute('fill', '#fff');
+    text.textContent = label;
+    svg.appendChild(text);
+  });
+}
+
+/* 计算 stage 尺寸并保存基础数据，随后由覆盖层按当前变换绘制 */
+function drawBoxes(img, boxes) {
+  const wrap = $('previewImageWrap');
+  const stage = $('previewStage');
   const Wc = wrap.clientWidth;
   const Hc = wrap.clientHeight;
   const Wi = img.naturalWidth;
   const Hi = img.naturalHeight;
   if (!Wi || !Hi || !Wc || !Hc) return;
-  c.width = Wc;
-  c.height = Hc;
-  const ctx = c.getContext('2d');
-  ctx.clearRect(0, 0, Wc, Hc);
-  if (!boxes || !boxes.length) return;
-  const scale = Math.min(Wc / Wi, Hc / Hi);
-  const dw = Wi * scale, dh = Hi * scale;
-  const ox = (Wc - dw) / 2, oy = (Hc - dh) / 2;
-  boxes.forEach(b => {
-    const bb = b.bbox || {};
-    const x1 = ox + (bb.x1 || 0) * dw;
-    const y1 = oy + (bb.y1 || 0) * dh;
-    const x2 = ox + (bb.x2 || 0) * dw;
-    const y2 = oy + (bb.y2 || 0) * dh;
-    const color = colorFor(b.category || '');
-    ctx.strokeStyle = color;
-    ctx.lineWidth = Math.max(2, dw / 400);
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.fillStyle = color;
-    ctx.font = Math.max(12, dw / 60) + 'px sans-serif';
-    const label = `${b.category || ''}${b.source === 'pre' ? ' [预]' : ''}`;
-    ctx.fillText(label, x1, Math.max(y1 - 4, 14));
-  });
-}
-
-/* ============ 导出 ============ */
-function doExport() {
-  if (!state.currentProjectId) return toast('请先选择项目');
-  const mode = $('exportMode').value;
-  toast('导出生成中，请稍候…');
-  const a = document.createElement('a');
-  a.href = '/api/export/' + state.currentProjectId + '?mode=' + mode;
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  const s = Math.min(Wc / Wi, Hc / Hi);
+  const dw = Math.round(Wi * s);
+  const dh = Math.round(Hi * s);
+  stage.style.width = dw + 'px';
+  stage.style.height = dh + 'px';
+  previewView.baseW = dw;
+  previewView.baseH = dh;
+  previewView.boxes = boxes || [];
+  drawPreviewOverlay();
 }
 
 /* ============ CSV 导出 ============ */
 function exportQueryCsv() {
   if (!state.queryResults.length) return toast('没有可导出的结果');
-  const rows = [['图片', '框坐标', '状态', '质检员']];
+  const rows = [['图片', '框坐标', '缺失子属性', '状态', '质检员', '提交身份']];
   state.queryResults.forEach(r => {
-    rows.push([r.image_id, boxesText(r), statusText(r.qc_status), r.qc_owner || '']);
+    rows.push([r.image_id, boxesText(r), violationsText(r), statusText(r.qc_status),
+      r.qc_owner || '', submitIdentityText(r)]);
   });
   const csv = '\uFEFF' + rows.map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -606,9 +877,14 @@ $('searchSelectAll').onchange = e => {
 $('searchBatchRejectBtn').onclick = () => batchQc('#searchTable', 'reject', doSearch);
 $('searchBatchPassBtn').onclick = () => batchQc('#searchTable', 'pass', doSearch);
 $('queryBtn').onclick = doQuery;
+$('ruleAddBtn').onclick = () => { state.rules.push({ parent: '', children: [] }); renderRules(); };
+$('ruleClearBtn').onclick = () => { state.rules = []; renderRules(); };
 $('labelPickerField').onclick = e => { e.stopPropagation(); $('labelPickerDropdown').classList.toggle('hidden'); };
 document.addEventListener('click', e => {
   if (!$('labelPicker').contains(e.target)) $('labelPickerDropdown').classList.add('hidden');
+  document.querySelectorAll('.cat-picker-dropdown').forEach(dd => {
+    if (!dd.parentElement.contains(e.target)) dd.classList.add('hidden');
+  });
 });
 $('queryStatus').onchange = () => renderQuery(state.queryResults);
 $('queryOwner').onchange = () => renderQuery(state.queryResults);
@@ -619,11 +895,15 @@ $('querySelectAll').onchange = e => {
 };
 $('batchRejectBtn').onclick = () => batchQc('#queryTable', 'reject', () => { if (state.queryResults.length) doQuery(); });
 $('batchPassBtn').onclick = () => batchQc('#queryTable', 'pass', () => { if (state.queryResults.length) doQuery(); });
-$('fpBtn').onclick = doFalsePass;
-$('exportBtn').onclick = doExport;
 $('fixBtn').onclick = doFix;
 $('previewClose').onclick = closePreview;
 $('previewModal').onclick = e => { if (e.target === $('previewModal')) closePreview(); };
+// 预览图片缩放 / 拖动
+$('previewImageWrap').addEventListener('wheel', onPreviewWheel, { passive: false });
+$('previewImageWrap').addEventListener('mousedown', onPreviewMouseDown);
+$('previewImageWrap').addEventListener('dblclick', resetPreviewView);
+window.addEventListener('mousemove', onPreviewMouseMove);
+window.addEventListener('mouseup', onPreviewMouseUp);
 
 /* ============ 启动 ============ */
 (async function boot() {
@@ -637,5 +917,6 @@ $('previewModal').onclick = e => { if (e.target === $('previewModal')) closePrev
   }
   $('projectBar').classList.remove('hidden');
   await loadProjects();
+  renderRules();
   startProjectAuto();   // 每 60s 静默刷新项目列表（新项目不用刷页面就能出现）
 })();

@@ -39,6 +39,8 @@
   <!-- 中间：照片 -->
   <section class="qc-main">
     <div id="qcViewer" class="viewer full"><div class="empty">请选择图片</div></div>
+    <!-- 右上角：几乎重合的框提示（不挡画框，pointer-events:none） -->
+    <div class="overlap-warn hidden" id="qcOverlapWarn"></div>
     <!-- 版本号 + 更新按钮（放取景器外面：loadImage/clearViewer 会清空取景器内容） -->
     <div class="qc-version" id="qcVersion"></div>
   </section>
@@ -61,10 +63,11 @@
       <select id="qcAnnotatorFilter"><option value="">全部作业员</option></select>
       <div class="label-picker" id="qcCatPicker">
         <div class="label-picker-field" id="qcCatPickerField">
-          <span class="placeholder">按属性筛选（可多选）</span>
+          <span class="placeholder">按属性筛选（含 / 排）</span>
         </div>
         <div class="label-picker-dropdown hidden" id="qcCatPickerDropdown"></div>
       </div>
+      <button class="btn" id="qcOverlapFilter" title="只显示存在几乎重合框的图片">只看重叠框</button>
     </div>
     <div class="qc-list-tabs">
       <button class="qc-tab active" data-status="pending">未质检<span class="qc-badge" id="badgePending"></span></button>

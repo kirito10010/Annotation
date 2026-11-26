@@ -58,10 +58,11 @@ function createViewer(container, imageUrl, boxes, opts) {
   let boxDrag = null;     // 拖动/缩放 {mode, index, corner?, edge?, startBox, startMx, startMy}
   let hideLabels = false; // 隐藏框和文字（只看原图）
   let hideText = false;   // 只隐藏标签文字，框照常显示
+  let overlapIndices = new Set();  // 参与「几乎重合」的框下标：红色虚线 + 「重合」标记
   let detachMove = null;  // 销毁时移除 window mousemove/mouseup 监听，避免每次换图累积监听器
   let detachUp = null;
 
-  const MIN_BOX = 0.002; // 最小归一化尺寸（约 0.2%，允许画小框）
+  const MIN_BOX = 0.0005; // 最小归一化尺寸（约 0.05%）：放大后画小框时，屏幕拖拽换算回归一化会变小，下限必须足够低
   const HANDLE = 8;      // 手柄/边线命中半径（屏幕像素）
 
   function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
@@ -138,12 +139,20 @@ function createViewer(container, imageUrl, boxes, opts) {
     drawOverlay();
   }
 
+  /* 标记哪些框参与「几乎重合」：在框外侧再画一圈红色虚线，并在右上角贴「重合」标记。
+     传空数组即清除。 */
+  function setOverlapIndices(arr) {
+    overlapIndices = new Set(arr || []);
+    drawOverlay();
+  }
+
   const viewerApi = {
     setSelected,
     redraw: drawOverlay,
     getSelected,
     setHideLabels,
     setHideText,
+    setOverlapIndices,
     el: viewer,   // DOM 引用，供外部 appendChild / 布局
     destroy() {   // 移除全局监听，避免换图后监听器越积越多导致卡顿
       if (detachMove) { detachMove(); detachMove = null; }
@@ -184,6 +193,27 @@ function createViewer(container, imageUrl, boxes, opts) {
          [x + w / 2, y], [x + w / 2, y + h], [x, y + h / 2], [x + w, y + h / 2]].forEach(([cx, cy]) => {
           ctx.fillRect(cx - hs, cy - hs, hs * 2, hs * 2);
         });
+      }
+
+      // 重合框：框外侧再画一圈红色虚线 + 右上角「重合」标记，便于一眼定位。
+      // 放在 hideText 判断之前 —— 只隐藏属性文字时，重合提示仍然保留。
+      if (overlapIndices.has(idx)) {
+        ctx.save();
+        ctx.strokeStyle = '#ff3b30';
+        ctx.lineWidth = (idx === selectedIndex) ? 4 : 2.5;
+        ctx.setLineDash([5, 3]);
+        ctx.strokeRect(x - 2, y - 2, w + 4, h + 4);
+        ctx.setLineDash([]);
+        ctx.font = 'bold 11px sans-serif';
+        const tag = '⚠ 重合';
+        const tw2 = ctx.measureText(tag).width;
+        const tagX = Math.max(0, x + w - tw2 - 8);
+        const tagY = Math.max(0, y + 2);
+        ctx.fillStyle = '#ff3b30';
+        ctx.fillRect(tagX, tagY, tw2 + 8, 16);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(tag, tagX + 4, tagY + 12);
+        ctx.restore();
       }
 
       const label = b.category || '';
@@ -395,4 +425,34 @@ function createViewer(container, imageUrl, boxes, opts) {
   if (onOpen && !editable) viewer.addEventListener('click', onOpen);
 
   return viewerApi;
+}
+
+/* 找出「高度重合」的框对，供两平台在照片右上角提示与画布标红。
+   判定用 IoU（交并比），与图片分辨率无关，避免小框用固定像素阈值时误判：
+     IoU = 交集面积 / 并集面积，>= 0.7 才算几乎重合。
+   返回 [{i, j, iou}]；i/j 是在 boxes 数组里的下标。 */
+function findNearDuplicateBoxes(boxes, iouMin) {
+  const thr = iouMin == null ? 0.7 : iouMin;
+  const out = [];
+  for (let i = 0; i < boxes.length; i++) {
+    const a = boxes[i] && boxes[i].bbox;
+    if (!a) continue;
+    const aw = a.x2 - a.x1, ah = a.y2 - a.y1;
+    if (aw <= 0 || ah <= 0) continue;
+    for (let j = i + 1; j < boxes.length; j++) {
+      const b = boxes[j] && boxes[j].bbox;
+      if (!b) continue;
+      const bw = b.x2 - b.x1, bh = b.y2 - b.y1;
+      if (bw <= 0 || bh <= 0) continue;
+      const iw = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
+      const ih = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
+      if (iw <= 0 || ih <= 0) continue;      // 没有重叠区域
+      const inter = iw * ih;
+      const union = aw * ah + bw * bh - inter;
+      if (union <= 0) continue;
+      const iou = inter / union;
+      if (iou >= thr) out.push({ i: i, j: j, iou: iou });
+    }
+  }
+  return out;
 }

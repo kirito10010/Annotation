@@ -92,7 +92,10 @@ const state = {
   search: '',
   annotatorFilter: '',
   boxFilter: 'all',    // 框数筛选：all / none(无框) / some(有框) / 精确数字 / '6+'
-  catFilter: [],       // 已选属性（分类名数组），用于右侧列表按属性筛选
+  catFilter: [],       // 包含属性（分类名数组）：只看命中其中任一分类的图
+  catExclude: [],      // 排除属性（分类名数组）：剔除命中其中任一分类的图
+  overlapOnly: false,  // 只看「有几乎重合框」的图
+  overlapIds: null,    // Set<imageId>，由 /api/qc/overlap 扫描得到
   annOf: {},
   anns: [],
 };
@@ -103,7 +106,9 @@ let dirty = false;   // 当前图是否被编辑过（决定提交前是否需�
 const boxCache = {};   // imageId -> {boxes, ts}，只用于「下一张」预取，且一次性消费
 const BOX_CACHE_TTL = 60000;   // 预取的框最多信 60 秒（避免很久以前预取的旧框被翻出来）
 let imageToken = 0;    // 换图自增，丢弃过期的异步标注框结果，避免串图
-let listEls = [];      // 右侧列表 DOM 项缓存，避免每次通过/换图都全量 querySelectorAll 扫描
+let listEls = [];      // 右侧列表 DOM 项缓存（按顺序），避免每次通过/换图都全量 querySelectorAll 扫描
+let rowMap = new Map(); // imageId -> 行元素，增量更新时 O(1) 查找
+const localBoxCounts = new Map(); // imageId -> {count, ts}：本地刚看过/改过的真实框数
 let lastListSig = '';  // 上次列表签名，内容没变就只刷新徽标、不重建 DOM（10s 轮询用）
 let pendingRebuild = null;  // 因 listBusy() 跳过的列表重建（含所属 pid/uid，避免串项目）
 
@@ -225,16 +230,27 @@ function loadProjectShortcuts(pid_) {
   state.shortcuts = { catKeys, pass, reject, hideText, hideLabels };
 }
 
-/* ============ 自动刷新：列表（10s）+ 每日质检量（60s）+ 项目列表（30s） ============ */
+/* ============ 自动刷新：列表（10s）+ 每日质检量（20s 兜底 + 操作后立即刷）+ 项目列表（30s） ============ */
 const POLL_MS = 10000;
-const DAILY_EVERY = 6;     // 每 6 次心跳（60s）刷一次每日统计 —— 它变化极慢
-const SETUP_EVERY = 3;     // 每 3 次心跳（30s）对一次项目/人员（原来每次心跳都发）
-const TICK_MIN_GAP = 5000; // 切回标签页时，距上次心跳不足 5s 就跳过，避免连发
+const DAILY_EVERY = 2;          // 每 2 次心跳（20s）兜底刷一次每日统计
+const SETUP_EVERY = 3;          // 每 3 次心跳（30s）对一次项目/人员（原来每次心跳都发）
+const TICK_MIN_GAP = 5000;      // 切回标签页时，距上次心跳不足 5s 就跳过，避免连发
+const DAILY_DEBOUNCE_MS = 1500; // 连续通过时把统计刷新合并成一次
 let _pollTimer = null;
 let _ticking = false;
 let _tickSeq = 0;
 let _lastTickAt = 0;
 let dailyToken = 0;
+let _dailyTimer = null;
+
+/* 每日统计的统一刷新入口：delay 缺省为去抖窗口，传 0 表示尽快（仍会合并同帧内的多次调用） */
+function scheduleDailyStats(delay) {
+  if (_dailyTimer) clearTimeout(_dailyTimer);
+  _dailyTimer = setTimeout(function () {
+    _dailyTimer = null;
+    loadDailyStats();
+  }, delay == null ? DAILY_DEBOUNCE_MS : delay);
+}
 
 function startPoll() {
   if (_pollTimer) return;
@@ -252,7 +268,7 @@ async function tick() {
   _lastTickAt = Date.now();
   const seq = ++_tickSeq;
   try {
-    if (seq % DAILY_EVERY === 0) loadDailyStats();
+    if (seq % DAILY_EVERY === 0) scheduleDailyStats(0);
     await refresh({ silent: true });
     if (seq % SETUP_EVERY === 0) await refreshProjects();
   } finally {
@@ -325,10 +341,13 @@ function formatDailyStats(title, days) {
     '</div>';
 }
 
-/* ============ 版本号 / 更新（照片区右下角） ============ */
+/* ============ 版本号 / 更新 / 在线人数（照片区右下角） ============ */
 /* 服务端把"查更新"的结果缓存 60 秒，前端也跟着 60 秒问一次，发版后能尽快看到。 */
 const VER_POLL_MS = 60000;
+const ONLINE_POLL_MS = 15000;   // 在线人数：心跳 5 秒一次，前端 15 秒问一次就够
 let verTimer = null;
+let onlineTimer = null;
+let _onlineCount = null;        // null = 未知/统计不可用，不显示
 
 async function loadVersion() {
   let r;
@@ -345,10 +364,36 @@ async function loadVersion() {
   const hint = has ? '<div class="ver-hint">有新版本 ' + esc(r.latest || '') + '</div>' : '';
   const btnText = has ? (can ? '更新' : '请手动替换') : (can ? '已是最新' : '管理员版');
   const disabled = !has || !can;
-  box.innerHTML = '<div class="ver-now">v' + esc(r.version || '?') + '</div>' + hint +
+  const online = _onlineCount == null ? '' : '<div class="ver-online">在线 ' + _onlineCount + ' 人</div>';
+  box.innerHTML = '<div class="ver-now">v' + esc(r.version || '?') + '</div>' + online + hint +
     '<button class="ver-btn" id="qcUpdateBtn"' + (disabled ? ' disabled' : '') + '>' + esc(btnText) + '</button>';
   const b = $('qcUpdateBtn');
   if (b && !disabled) b.onclick = applyUpdate;
+}
+
+async function loadOnline() {
+  let r;
+  try {
+    r = await api('/api/online');
+  } catch (e) {
+    return;   // 拉不到保持现状
+  }
+  if (!r || !r.ok) return;
+  _onlineCount = r.enabled ? r.count : null;   // 端口绑定失败时 stats 不可用 → 不显示
+  renderOnline();
+}
+
+/* 版本块每 60 秒才重绘一次；在线人数 15 秒更新，直接改子节点，不重建整个块。 */
+function renderOnline() {
+  const box = $('qcVersion');
+  if (!box) return;
+  const el = box.querySelector('.ver-online');
+  if (el) {
+    if (_onlineCount == null) el.remove();
+    else el.textContent = '在线 ' + _onlineCount + ' 人';
+  } else if (_onlineCount != null) {
+    loadVersion();   // 版本块还没渲染（或刚被重绘），让它把在线人数一起画出来
+  }
 }
 
 async function applyUpdate() {
@@ -375,6 +420,12 @@ function startVersionAuto() {
   verTimer = setInterval(loadVersion, VER_POLL_MS);
 }
 
+function startOnlineAuto() {
+  if (onlineTimer) return;
+  loadOnline();
+  onlineTimer = setInterval(loadOnline, ONLINE_POLL_MS);
+}
+
 /* ============ 初始化 ============ */
 async function init() {
   // 判断是否发布版
@@ -397,6 +448,7 @@ async function init() {
   startPoll();
   loadVersion();        // 照片区右下角：当前版本 + 更新按钮
   startVersionAuto();
+  startOnlineAuto();    // 版本信息旁：同时在线人数
 }
 
 function applyReleaseUI() {
@@ -463,6 +515,7 @@ function renderReviewerSelect(reviewers) {
   } else {
     state.reviewerUid = null;
     listEls = [];
+    rowMap.clear();
     lastListSig = '';
     $('qcList').innerHTML = '<div class="empty">该项目暂无质检员</div>';
     clearViewer();
@@ -506,6 +559,7 @@ async function probeReviewerLogin() {
   } else if (res && res.need_login) {
     clearCounts();
     listEls = [];
+    rowMap.clear();
     lastListSig = '';
     $('qcList').innerHTML = '<div class="empty">该质检员需登录后查看</div>';
     openReviewerLogin(state.reviewers.find((x) => x.uid === state.reviewerUid));
@@ -571,6 +625,7 @@ function setActiveCategory(cat) {
     const idx = currentViewer.getSelected();
     if (idx >= 0 && currentBoxes[idx]) {
       currentBoxes[idx].category = cat;
+      updateOverlapWarn();   // 提示里的属性名要跟着变
       currentViewer.redraw();
       currentViewer.setSelected(-1);
       dirty = true;
@@ -633,55 +688,137 @@ function resetFilters() {
   state.search = '';
   state.annotatorFilter = '';
   state.catFilter = [];
+  state.catExclude = [];
+  state.overlapOnly = false;
+  state.overlapIds = null;
   state.boxFilter = 'all';
   $('qcSearch').value = '';
   $('qcBoxFilter').value = 'all';
+  updateOverlapFilterBtn();
   renderAnnotatorFilter();   // 重建「全部作业员」下拉
   renderCatPicker();         // 重建属性多选（清空勾选）
   lastListSig = '';          // 强制重建列表
 }
 
-/* ============ 属性多选筛选 ============ */
+/* ============ 属性多选筛选（含 / 排） ============ */
 function renderCatPicker() {
   const dd = $('qcCatPickerDropdown');
   dd.innerHTML = '';
   state.categories.forEach((c) => {
-    const lab = document.createElement('label');
-    lab.className = 'label-picker-option';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.value = c;
-    cb.checked = state.catFilter.includes(c);
-    cb.onchange = () => {
-      if (cb.checked) state.catFilter.push(c);
-      else state.catFilter = state.catFilter.filter((x) => x !== c);
+    const row = document.createElement('div');
+    row.className = 'label-picker-option';
+
+    // 左：只看包含该属性
+    const inc = document.createElement('label');
+    inc.className = 'lp-check lp-inc';
+    inc.title = '只看包含该属性的图';
+    const incCb = document.createElement('input');
+    incCb.type = 'checkbox';
+    incCb.value = c;
+    incCb.checked = state.catFilter.includes(c);
+    inc.appendChild(incCb);
+    inc.appendChild(document.createTextNode('含'));
+
+    const name = document.createElement('span');
+    name.className = 'lp-name';
+    name.textContent = c;
+
+    // 右：排除包含该属性
+    const exc = document.createElement('label');
+    exc.className = 'lp-check lp-exc';
+    exc.title = '排除包含该属性的图';
+    const excCb = document.createElement('input');
+    excCb.type = 'checkbox';
+    excCb.value = c;
+    excCb.checked = state.catExclude.includes(c);
+    exc.appendChild(excCb);
+    exc.appendChild(document.createTextNode('排'));
+
+    // 同一属性「含/排」互斥：勾一边自动取消另一边
+    incCb.onchange = () => {
+      if (incCb.checked) {
+        if (!state.catFilter.includes(c)) state.catFilter.push(c);
+        state.catExclude = state.catExclude.filter((x) => x !== c);
+        excCb.checked = false;
+      } else {
+        state.catFilter = state.catFilter.filter((x) => x !== c);
+      }
       updateCatPickerField();
       refresh({});   // 属性筛选走后端，重新拉列表（计数同源更新）
     };
-    lab.appendChild(cb);
-    const span = document.createElement('span');
-    span.textContent = c;
-    lab.appendChild(span);
-    dd.appendChild(lab);
+    excCb.onchange = () => {
+      if (excCb.checked) {
+        if (!state.catExclude.includes(c)) state.catExclude.push(c);
+        state.catFilter = state.catFilter.filter((x) => x !== c);
+        incCb.checked = false;
+      } else {
+        state.catExclude = state.catExclude.filter((x) => x !== c);
+      }
+      updateCatPickerField();
+      refresh({});
+    };
+
+    row.appendChild(inc);
+    row.appendChild(name);
+    row.appendChild(exc);
+    dd.appendChild(row);
   });
   updateCatPickerField();
 }
 
 function updateCatPickerField() {
   const el = $('qcCatPickerField');
-  const n = state.catFilter.length;
+  const tags = state.catFilter.map((c) => '<span class="label-picker-tag">' + esc(c) + '</span>')
+    .concat(state.catExclude.map((c) => '<span class="label-picker-tag label-picker-tag-exc">' + esc(c) + '</span>'));
+  const n = tags.length;
   if (!n) {
-    el.innerHTML = '<span class="placeholder">按属性筛选（可多选）</span>';
+    el.innerHTML = '<span class="placeholder">按属性筛选（含 / 排）</span>';
   } else if (n <= 2) {
-    el.innerHTML = state.catFilter.map((c) => '<span class="label-picker-tag">' + esc(c) + '</span>').join('');
+    el.innerHTML = tags.join('');
   } else {
-    el.innerHTML = state.catFilter.slice(0, 2).map((c) => '<span class="label-picker-tag">' + esc(c) + '</span>').join('')
+    el.innerHTML = tags.slice(0, 2).join('')
       + '<span class="label-picker-tag label-picker-more">+' + (n - 2) + '</span>';
   }
 }
 
 function toggleCatPicker() {
   $('qcCatPickerDropdown').classList.toggle('hidden');
+}
+
+/* ============ 只看重叠框（一键筛选） ============ */
+function updateOverlapFilterBtn() {
+  const btn = $('qcOverlapFilter');
+  if (!btn) return;
+  btn.classList.toggle('active', state.overlapOnly);
+  btn.textContent = state.overlapOnly ? '取消重叠筛选' : '只看重叠框';
+}
+
+async function toggleOverlapFilter() {
+  if (state.overlapOnly) {   // 关闭
+    state.overlapOnly = false;
+    state.overlapIds = null;
+    updateOverlapFilterBtn();
+    refresh({});
+    return;
+  }
+  const btn = $('qcOverlapFilter');
+  if (btn) { btn.disabled = true; btn.textContent = '扫描重叠框…'; }
+  try {
+    const r = await api('/api/qc/overlap?pid=' + encodeURIComponent(pid()) +
+                        '&uid=' + encodeURIComponent(uid()));
+    if (!r || !r.ok) { toast((r && r.error) || '扫描失败'); return; }
+    const ids = r.ids || [];
+    if (!ids.length) { toast('当前项目没有检测到重合框'); return; }
+    state.overlapIds = new Set(ids);
+    state.overlapOnly = true;
+    lastListSig = '';
+    refresh({});
+  } catch (e) {
+    toast('扫描失败（网络异常）');
+  } finally {
+    if (btn) btn.disabled = false;
+    updateOverlapFilterBtn();
+  }
 }
 
 /* 框数筛选：all=全部 none=无框 some=有框 '6+'=6 框及以上，其它=精确框数。
@@ -701,6 +838,7 @@ function applyFilters(items, boxCounts) {
   return items.filter((id) => {
     if (kw && id.toLowerCase().indexOf(kw) < 0) return false;
     if (!boxMatch(id, boxCounts || {})) return false;
+    if (state.overlapOnly && (!state.overlapIds || !state.overlapIds.has(id))) return false;
     if (state.annotatorFilter) {
       const a = state.annOf[id];
       if (!a || a.uid !== state.annotatorFilter) return false;
@@ -720,8 +858,9 @@ function listUrl(force) {
   } else {
     base = '/api/qc/assigned';
     q.push('status=' + state.status, 'offset=0', 'limit=100000');
-    if (state.catFilter.length) q.push('cat=' + encodeURIComponent(state.catFilter.join(',')));
   }
+  if (state.catFilter.length) q.push('cat=' + encodeURIComponent(state.catFilter.join(',')));
+  if (state.catExclude.length) q.push('exc=' + encodeURIComponent(state.catExclude.join(',')));
   if (force) q.push('force=1');   // 打穿服务端内存缓存，取最新快照
   return base + '?' + q.join('&');
 }
@@ -749,12 +888,13 @@ function clearCounts() {
 
 /* 是否有前端筛选在生效（决定要不要在徽标后面标「筛选后 M」） */
 function filtersActive() {
-  return !!(state.search.trim() || state.annotatorFilter || state.catFilter.length ||
-            (state.boxFilter && state.boxFilter !== 'all'));
+  return !!(state.search.trim() || state.annotatorFilter || state.catFilter.length || state.catExclude.length ||
+            state.overlapOnly || (state.boxFilter && state.boxFilter !== 'all'));
 }
 
 function showListError(msg) {
   listEls = [];
+  rowMap.clear();
   lastActiveId = null;
   $('qcList').innerHTML = '<div class="empty"><div>' + esc(msg || '加载失败') + '</div>' +
     '<div class="empty-action"><button class="btn" data-empty-action="retry">重试</button></div></div>';
@@ -762,20 +902,55 @@ function showListError(msg) {
 
 /* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
 function listSignature(items, boxCounts) {
-  return [state.status, state.catFilter.join(','), state.search, state.annotatorFilter, state.boxFilter,
+  return [state.status, state.catFilter.join(','), state.catExclude.join(','), state.overlapOnly,
+          state.search, state.annotatorFilter, state.boxFilter,
           items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
 }
 
+/* 增量更新列表：复用已有行，只增删差集并按顺序移动，避免每 10 秒重建上万个 DOM 节点。
+   顺序没变时只会改几个文本节点（框数/标注人）。 */
 function rebuildList(items, boxCounts, rawCount, snapshotMissing, counts) {
   const listEl = $('qcList');
-  listEl.innerHTML = '';
-  listEls = [];
-  lastActiveId = null;
   if (!items.length) {
     listEl.innerHTML = emptyStateHtml({ counts, rawCount, snapshotMissing });
+    listEls = [];
+    rowMap.clear();
+    lastActiveId = null;
     return;
   }
-  items.forEach((id) => makeListItem(id, (state.annOf[id] || {}).name, boxCounts[id]));
+  // 从空态切回列表：清掉空态占位
+  if (listEl.querySelector('.empty')) {
+    listEl.innerHTML = '';
+    listEls = [];
+    rowMap.clear();
+  }
+
+  // 1) 删除不在新列表里的行
+  const keep = new Set(items);
+  for (const [id, el] of rowMap) {
+    if (!keep.has(id)) {
+      el.remove();
+      rowMap.delete(id);
+    }
+  }
+
+  // 2) 创建缺失行、更新已有行，并按新顺序排列（appendChild/insertBefore 会移动已有节点，不重建）
+  let prev = null;
+  items.forEach((id) => {
+    const cnt = effectiveBoxCount(id, boxCounts[id]);
+    let el = rowMap.get(id);
+    if (!el) {
+      el = createListItem(id, (state.annOf[id] || {}).name, cnt);
+      rowMap.set(id, el);
+    } else {
+      updateListItem(el, (state.annOf[id] || {}).name, cnt);
+    }
+    const expectedNext = prev ? prev.nextSibling : listEl.firstChild;
+    if (expectedNext !== el) listEl.insertBefore(el, expectedNext);
+    prev = el;
+  });
+  listEls = items.map((id) => rowMap.get(id));
+  if (lastActiveId && !rowMap.has(lastActiveId)) lastActiveId = null;
 }
 
 /* 空列表必须说清「为什么空」：以前只有一句「暂无未质检图」+ 中间一块纯黑，
@@ -933,7 +1108,8 @@ function statusEmptyText() {
   return '暂无最近提交';
 }
 
-function makeListItem(id, annName, boxCount) {
+/* 创建一行（不插入 DOM，由 rebuildList 统一按顺序插入） */
+function createListItem(id, annName, boxCount) {
   const item = document.createElement('div');
   item.className = 'qc-item';
   item.dataset.id = id;
@@ -946,12 +1122,6 @@ function makeListItem(id, annName, boxCount) {
   nameEl.textContent = id;
   nameEl.title = id;   // 鼠标悬浮显示完整文件名
   row1.appendChild(nameEl);
-  if (boxCount != null) {
-    const bc = document.createElement('span');
-    bc.className = 'qc-box-count';
-    bc.textContent = boxCount + ' 框';
-    row1.appendChild(bc);
-  }
   const copyBtn = document.createElement('button');
   copyBtn.className = 'qc-copy-btn';
   copyBtn.type = 'button';
@@ -964,39 +1134,125 @@ function makeListItem(id, annName, boxCount) {
   row1.appendChild(copyBtn);
   item.appendChild(row1);
 
-  // 第二行：标注人
-  if (annName) {
-    const tag = document.createElement('div');
-    tag.className = 'qc-ann-tag';
-    tag.textContent = '标注：' + annName;
-    item.appendChild(tag);
-  }
-
   item.onclick = () => loadImage(id);
-  $('qcList').appendChild(item);
-  listEls.push(item);
+  updateListItem(item, annName, boxCount);
+  return item;
+}
+
+/* 本地刚看过/改过的真实框数：90 秒内优先于 /images 快照，避免刚校正又被旧快照覆盖。
+   90 秒后快照（TTL 60s + 探针）已经能追上，自然回落到服务端数据。 */
+const LOCAL_BOX_TTL_MS = 90000;
+function rememberBoxCount(id, count) {
+  localBoxCounts.set(id, { count: count, ts: Date.now() });
+  const el = rowMap.get(id);
+  if (el) updateListItem(el, (state.annOf[id] || {}).name, count);
+}
+function effectiveBoxCount(id, snapshot) {
+  const lc = localBoxCounts.get(id);
+  if (!lc) return snapshot;
+  if (Date.now() - lc.ts > LOCAL_BOX_TTL_MS) {
+    localBoxCounts.delete(id);
+    return snapshot;
+  }
+  return lc.count;
+}
+
+/* 打开图片时用 /annotation 的实时状态校验列表：状态已变则立即刷新列表，避免按旧状态操作 */
+function maybeSyncQcStatus(live) {
+  const s = (live || '').toLowerCase();
+  if (s !== 'pending' && s !== 'passed' && s !== 'rejected') return;
+  if (state.status === 'recent' || state.status === s) return;
+  toast('该图状态已变化，列表已刷新');
+  refresh({ force: true });
+}
+
+/* 只更新发生变化的文本，避免整行重建 */
+function updateListItem(item, annName, boxCount) {
+  const cnt = (boxCount == null) ? '' : String(boxCount);
+  if (item.dataset.boxCount !== cnt) {
+    item.dataset.boxCount = cnt;
+    const row1 = item.firstChild;
+    let bc = row1.querySelector('.qc-box-count');
+    if (cnt === '') {
+      if (bc) bc.remove();
+    } else if (bc) {
+      bc.textContent = cnt + ' 框';
+    } else {
+      bc = document.createElement('span');
+      bc.className = 'qc-box-count';
+      bc.textContent = cnt + ' 框';
+      row1.insertBefore(bc, row1.querySelector('.qc-copy-btn'));
+    }
+  }
+  const an = annName || '';
+  if (item.dataset.annName !== an) {
+    item.dataset.annName = an;
+    let tag = item.querySelector('.qc-ann-tag');
+    if (!an) {
+      if (tag) tag.remove();
+    } else if (tag) {
+      tag.textContent = '标注：' + an;
+    } else {
+      tag = document.createElement('div');
+      tag.className = 'qc-ann-tag';
+      tag.textContent = '标注：' + an;
+      item.appendChild(tag);
+    }
+  }
 }
 
 let lastActiveId = null;   // 当前高亮的列表项 id，避免每次全量 toggle 几千条
 
 function highlightListItem(id) {
-  if (lastActiveId === id) return;
+  // 同一个 id 的行可能被删掉后又重新出现（打回 → 作业员重提），必须确认行还在且确实高亮
+  if (lastActiveId === id) {
+    const cur = rowMap.get(id);
+    if (cur && cur.classList.contains('active')) return;
+  }
   if (lastActiveId) {
-    const p = listEls.find((el) => el.dataset.id === lastActiveId);
+    const p = rowMap.get(lastActiveId);
     if (p) p.classList.remove('active');
   }
-  const c = listEls.find((el) => el.dataset.id === id);
+  const c = rowMap.get(id);
   if (c) c.classList.add('active');
   lastActiveId = id;
 }
 
 /* ============ 中间照片 ============ */
+/* 右上角提示：同一张图里四角几乎重合的框对（帮助发现重复标注） */
+function updateOverlapWarn() {
+  const el = $('qcOverlapWarn');
+  if (!el) return;
+  const pairs = findNearDuplicateBoxes(currentBoxes);
+  // 画布上同步标红：参与重合的框加红色虚线 + 「重合」标记
+  if (currentViewer) {
+    const idxs = [];
+    pairs.forEach((p) => { idxs.push(p.i, p.j); });
+    currentViewer.setOverlapIndices(idxs);
+  }
+  if (!pairs.length) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  if (pairs.length === 1) {
+    const p = pairs[0];
+    const ca = (currentBoxes[p.i] && currentBoxes[p.i].category) || '未分类';
+    const cb = (currentBoxes[p.j] && currentBoxes[p.j].category) || '未分类';
+    el.textContent = '⚠ 框' + (p.i + 1) + ' / 框' + (p.j + 1) + ' 几乎重合（' + ca + ' / ' + cb + '）';
+  } else {
+    el.textContent = '⚠ ' + pairs.length + ' 对框几乎重合';
+  }
+  el.classList.remove('hidden');
+}
+
 function clearViewer() {
   imageToken++;   // 使在途的标注框加载失效
   const v = $('qcViewer');
   if (currentViewer) { currentViewer.destroy(); currentViewer = null; }
   v.innerHTML = '<div class="empty">左侧列表暂无可显示的图</div>';
   currentBoxes = [];
+  updateOverlapWarn();
   state.currentImage = null;
   dirty = false;
   updateActionButtons();
@@ -1019,21 +1275,26 @@ function loadImage(id) {
       const cat = state.activeCategory || state.categories[0];
       if (!cat) { toast('请先在左侧选择属性'); return; }
       currentBoxes.push({ category: cat, bbox: bbox, source: 'manual' });
+      rememberBoxCount(id, currentBoxes.length);
+      updateOverlapWarn();
       currentViewer.redraw();
       currentViewer.setSelected(-1);
       dirty = true;
     },
     onDelete: (idx) => {
       currentBoxes.splice(idx, 1);
+      rememberBoxCount(id, currentBoxes.length);
+      updateOverlapWarn();
       currentViewer.setSelected(-1);
       currentViewer.redraw();
       dirty = true;
     },
     // 拖动/缩放框也是「改过」——以前漏了这一路，移动完框直接按「通过」不会保存，改动就丢了
-    onBoxAdjusted: () => { dirty = true; },
+    onBoxAdjusted: () => { dirty = true; updateOverlapWarn(); },
   });
   currentViewer.setHideLabels(state.hideLabels);
   currentViewer.setHideText(state.hideText);
+  updateOverlapWarn();   // 新图框还没回来 → 先清掉上一张的提示
   // 只预取紧接着的 PREFETCH_NEXT 张图（默认 1 张），并对下一张预取标注框：
   // 切过去时框已在 boxCache 里，省掉一次同步 /annotation，做到「图快框也快」。
   const curIdx = listEls.findIndex((el) => el.dataset.id === id);
@@ -1051,6 +1312,8 @@ function loadImage(id) {
   if (cachedBoxes) {
     // 深拷贝，避免后续编辑框时反向污染缓存
     cachedBoxes.forEach((b) => currentBoxes.push(JSON.parse(JSON.stringify(b))));
+    rememberBoxCount(id, currentBoxes.length);   // 用真实框数校正列表
+    updateOverlapWarn();
     currentViewer.redraw();
   } else {
     api('/api/projects/' + encodeURIComponent(pid()) + '/annotation?image_id=' + encodeURIComponent(id) + uidParam())
@@ -1059,6 +1322,9 @@ function loadImage(id) {
         if (!ann || !ann.ok) { onBoxLoadError(ann); return; }
         currentBoxes.length = 0;
         (ann.boxes || []).forEach((b) => currentBoxes.push(b));
+        rememberBoxCount(id, currentBoxes.length);   // 列表里的框数可能与快照不一致
+        maybeSyncQcStatus(ann.qc_status);            // 状态已被别人改过 → 刷新列表
+        updateOverlapWarn();
         currentViewer.redraw();
       })
       .catch(() => onBoxLoadError(null));
@@ -1095,7 +1361,7 @@ function verdict(v) {
   //    是安全的 —— 换图只是重新给 currentBoxes 赋值，不影响已经发出的请求。
   const saveP = needSave
     ? api('/api/qc/save', { method: 'POST',
-        body: { pid: pid(), image_id: imageId, boxes: currentBoxes } })
+        body: { pid: pid(), image_id: imageId, boxes: currentBoxes, uid: uid() } })
     : null;
   dirty = false;
 
@@ -1117,6 +1383,7 @@ function verdict(v) {
         verdictFailed((p && p.error) || (v === 'pass' ? '通过失败' : '打回失败'));
         return;
       }
+      scheduleDailyStats();   // 记账已落库 → 刷新今日质检量
       scheduleRefresh();   // 成功：合并刷新（连续通过只刷一次），不再每次都全量重拉
     } finally {
       busyOps--;
@@ -1170,7 +1437,7 @@ async function saveBoxes() {
   busyOps++;
   try {
     const imageId = state.currentImage;
-    const r = await api('/api/qc/save', { method: 'POST', body: { pid: pid(), image_id: imageId, boxes: currentBoxes } });
+    const r = await api('/api/qc/save', { method: 'POST', body: { pid: pid(), image_id: imageId, boxes: currentBoxes, uid: uid() } });
     if (!r || !r.ok) { toast((r && r.error) || '保存失败'); return; }
     toast('已保存 ' + r.box_count + ' 框');
     dirty = false;
@@ -1186,13 +1453,15 @@ function advanceAfter(id) {
   const idx = listEls.findIndex((el) => el.dataset.id === id);
   const item = idx >= 0 ? listEls[idx] : null;
   const next = item ? listEls[idx + 1] : null;   // 用数组下标找下一个，避免全量 DOM 扫描
-  if (item) { item.remove(); listEls.splice(idx, 1); }
+  if (item) { item.remove(); listEls.splice(idx, 1); rowMap.delete(id); }
+  if (lastActiveId === id) lastActiveId = null;
   if (next && next.dataset.id) {
     loadImage(next.dataset.id);
   } else {
     clearViewer();
     if (!listEls.length) {
       $('qcList').innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+      rowMap.clear();
     }
   }
 }
@@ -1405,6 +1674,7 @@ $('qcSearch').addEventListener('input', () => { state.search = $('qcSearch').val
 $('qcAnnotatorFilter').onchange = () => { state.annotatorFilter = $('qcAnnotatorFilter').value; refresh({}); };
 $('qcBoxFilter').onchange = () => { state.boxFilter = $('qcBoxFilter').value; refresh({}); };
 $('qcRefresh').onclick = onManualRefresh;
+$('qcOverlapFilter').onclick = toggleOverlapFilter;
 // 空列表里的「清空筛选 / 重试」按钮（列表内容是动态重建的，所以用事件委托）
 $('qcList').addEventListener('click', (e) => {
   const b = e.target.closest('[data-empty-action]');
@@ -1439,6 +1709,6 @@ window.addEventListener('pageshow', (e) => {
   }
 });
 /* 从别的标签页切回来时立即对齐一次 */
-document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { tick(); scheduleDailyStats(0); } });
 
 init();

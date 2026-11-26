@@ -13,6 +13,7 @@ import os
 import io
 import re
 import shutil
+import socket
 import time
 import threading
 import webbrowser
@@ -22,12 +23,17 @@ import urllib.parse
 import urllib.error
 import concurrent.futures
 import sys
+import uuid
 import pystray
 from PIL import Image
 
 BASE = "http://172.21.205.141:8771"      # Label Auto 平台地址
 PORT_START = 5221                         # 监听端口
 SORT_CONCURRENCY = 16                     # 查询时并发拉取实时 annotation 的并发上限
+OVERLAP_IOU = 0.7                         # 重叠框扫描：交并比阈值（与分辨率无关，和前端一致）
+OVERLAP_EXPORT_FORCE_GAP = 60             # 同一项目最多每 60 秒强制刷新一次导出
+_OVERLAP_EXPORT_TS = {}                   # pid -> 上次强制刷新导出的时间
+_OVERLAP_EXPORT_LOCK = threading.Lock()
 QC_EMAIL = "v_yuronghua@baidu.com"       # 质检平台默认登录账号（owner/admin）
 QC_PASSWORD = "pw123456"
 # 打包成 exe（PyInstaller 冻结）时：静态文件在临时解压目录 _MEIPASS 里。
@@ -42,16 +48,16 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.0.0"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+VERSION = "2.0.3"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 # 自更新清单：跟着「最新 Release」的资产走，URL 里不带版本 tag
 # （借鉴 naruto-launcher 的 generic provider：/releases/latest/download/<asset>）。
 # 多个镜像并发探测，谁先回谁参与比较，取版本最高的一份。
-GITHUB_LATEST = "https://github.com/kirito10010/test/releases/latest/download"
+GITHUB_LATEST = "https://github.com/kirito10010/Annotation/releases/latest/download"
 UPDATE_URLS = [
     "https://gh-proxy.com/" + GITHUB_LATEST + "/version.json",
     "https://ghfast.top/" + GITHUB_LATEST + "/version.json",
     "https://ghproxy.net/" + GITHUB_LATEST + "/version.json",
-    "https://raw.githubusercontent.com/kirito10010/test/main/version.json",  # 兜底
+    "https://raw.githubusercontent.com/kirito10010/Annotation/main/version.json",  # 兜底
 ]
 UPDATE_PROBE_TIMEOUT = 5          # 单个清单源超时（秒）
 # 资产下载候选前缀（国内加速镜像优先；直连放最后）
@@ -64,6 +70,31 @@ DOWNLOAD_MIRRORS = [
 DOWNLOAD_PARTS = 8                # 分段并发数（分段轮流分配到不同镜像）
 DOWNLOAD_RANGE_MIN = 4 * 1024 * 1024   # 小于 4MB 不值得分段
 DOWNLOAD_PROBE_BYTES = 256 * 1024      # 测速用的首段字节数
+
+# ---------- 在线人数（局域网 UDP 心跳自发现） ----------
+# 每个进程每 5 秒广播一次心跳；收到别人的心跳就登记，20 秒没心跳视为离线。
+# 端口按构建区分，避免同一台机器上 Admin 与 Staff 抢同一个 UDP 端口；
+# 发送时两个端口都发，所以两种构建能互相看见。
+PRESENCE_PORTS = (53321, 53322)
+PRESENCE_LISTEN_PORT = 53322 if RELEASE_MODE else 53321
+PRESENCE_INTERVAL = 5      # 秒
+PRESENCE_TIMEOUT = 20      # 秒
+_PRESENCE_ID = uuid.uuid4().hex
+_PRESENCE_HOST = socket.gethostname()
+_PRESENCE_HOST_HASH = hashlib.sha256(_PRESENCE_HOST.encode("utf-8")).hexdigest()[:16]
+_PRESENCE_LOCK = threading.Lock()
+_PRESENCE = {}             # instance_id -> {"host": str, "role": str, "ts": float}
+_PRESENCE_ENABLED = True   # listener 绑定成功才为 True
+
+# ---------- 在线人数（云端注册表，主方案） ----------
+# 每 15 秒向公网注册表上报心跳，服务端按机器去重后返回当前在线数。
+# 注册表连续不可用时（超过 ONLINE_TTL）自动回退到上面的局域网广播。
+ONLINE_REGISTRY = "http://111.229.99.73:39417"
+ONLINE_TOKEN = "la-9f4c1d7b-2026"
+ONLINE_INTERVAL = 15       # 心跳间隔（秒）
+ONLINE_TTL = 40            # 云端结果有效期（秒），超时后走局域网兜底
+_ONLINE_LOCK = threading.Lock()
+_ONLINE = {"count": 0, "ts": 0.0, "ok": False}
 
 # ---------- 会话状态 ----------
 TOKEN = None
@@ -79,8 +110,21 @@ _PROGRESS = {"phase": "", "total": 0, "done": 0}
 _RECENT_GROUPS = []
 
 # 保存标注后，该图在平台侧会被重置为 pending，但 /images 快照有滞后；
-# 记录 pid -> set(image_id)，用于在 counts/assigned 里把它当 pending 纠正。
+# 记录 (pid, uid) -> set(image_id)，用于在 counts/assigned 里把它当 pending 纠正。
+# 必须按账号隔离：同一台机器换账号时，上一个账号的保存不能影响下一个账号的状态统计。
 _SAVE_PENDING = {}
+
+
+def _reset_session_state():
+    """账号切换（登录/登出）时清掉与上一个账号绑定的内存状态。
+
+    _SAVE_PENDING 会把保存过的图在列表里强行当成 pending。同一台机器上
+    作业员做完退出、再登录质检员时，如果不清掉，质检员会看到「已通过」
+    少了一批、「未质检」多了一批（实测约 1000 张）。
+    """
+    _SAVE_PENDING.clear()
+    _RECENT_GROUPS.clear()
+    _USER_CREDENTIALS.clear()
 
 # 质检员/作业员登录凭据（用于以其本人 token 提交 /qc，使平台按 token 正确归属质检结果；
 # 也用于局域网访问时按「是否有内置账号」决定是否弹登录框）。
@@ -387,7 +431,7 @@ _IMAGES_REFRESHING = set()   # 正在后台刷新的 pid，避免重复刷新
 # 这个接口很重（实测 6514 张 ≈ 921KB / 307ms），所以不能把 TTL 调小硬刷；
 # 改成用轻探针 monitoring（52KB / 124ms，已缓存 10s）里的标注/质检进度当「有变化」的信号，
 # 进度一变就在后台提前重拉一次 —— 忙时更新快（≤12s），闲时一次都不多拉。
-IMAGES_TTL = 180             # 兜底：没有任何信号时，多久重拉一次快照
+IMAGES_TTL = 60              # 兜底：没有任何信号时，多久重拉一次快照（探针仍是主路径）
 IMAGES_PROBE_MIN_GAP = 12    # 探针判定「有变化」时，两次重拉之间至少隔这么久（秒）
 
 _IMAGES_PROGRESS = {}        # pid -> 上次判定时 monitoring 里的 (total_annotated, qc_passed, qc_rejected)
@@ -574,7 +618,7 @@ def _get_owner_token():
 #   monitoring（轻，约 39KB）：当"变更探针"，拉得勤 → 新项目/结构变化能被及时看到
 #   projects  （重，含每个项目全部 assignments/qc_assignments，项目多时 MB 级）：只管"少拉几次"
 # 两者配合：探针发现结构签名变了 → 立刻强拉一次 projects，所以 projects 的 TTL 可以放长。
-MONITORING_TTL = 10      # 秒：探针的缓存时长（也是强拉 projects 的节流窗口）
+MONITORING_TTL = 5       # 秒：探针的缓存时长（也是强拉 projects 的节流窗口）
 PROJECTS_TTL = 300       # 秒：重接口的缓存时长（结构变化时会提前刷，不必为新鲜度设短）
 PROJECTS_FORCE_MAX_TRIES = 3   # 同一处不一致最多强拉几次（上游迟迟不同步就放弃，等 TTL）
 
@@ -757,17 +801,47 @@ def build_uid_name_map():
 
 def build_qc_owner_map(pid):
     """pic_base -> 质检员名字"""
-    proj = get_project(pid)
+    assignee = build_qc_assignee_map(pid)
     names = build_uid_name_map()
+    return {base: names.get(uid, uid) for base, uid in assignee.items()}
+
+
+def build_qc_assignee_map(pid):
+    """pic_base -> 质检员 uid（来自 qc_assignments）"""
+    proj = get_project(pid) or {}
     result = {}
-    if proj:
-        qa = proj.get("qc_assignments") or {}
-        for uid, files in qa.items():
-            nm = names.get(uid, uid)
-            for f in files:
-                base = os.path.splitext(os.path.basename(f))[0]
-                result[base] = nm
+    for uid, files in (proj.get("qc_assignments") or {}).items():
+        for f in files:
+            result[_base_name(f)] = uid
     return result
+
+
+def _has_qc_credential(uid):
+    """该 uid 是否具备可用登录凭据（已登录 token / 内置 / 发布版记住的凭据）"""
+    return bool(uid) and (uid in _QC_TOKENS or uid in _QC_LOGIN or uid in _USER_CREDENTIALS)
+
+
+def _owner_display_name():
+    """owner（QC_EMAIL）的显示名；拿不到就返回「管理员」"""
+    try:
+        for u in get_users().get("users", []):
+            if isinstance(u, dict) and (u.get("email") or "").lower() == QC_EMAIL.lower():
+                return u.get("display_name") or "管理员"
+    except Exception:
+        pass
+    return "管理员"
+
+
+def _submit_identity(uid, names, owner_name):
+    """预测该图批量提交（通过/打回）时使用的身份。"""
+    if not uid:
+        return {"as": "owner", "name": owner_name,
+                "note": "未分配质检员，将以管理员身份提交"}
+    nm = names.get(uid, uid)
+    if _has_qc_credential(uid):
+        return {"as": "reviewer", "name": nm, "note": "使用质检员本人凭据"}
+    return {"as": "owner", "name": owner_name,
+            "note": "%s 未配置登录凭据，将以管理员身份提交" % nm}
 
 
 def category_to_export_idx(proj, cat_name):
@@ -802,6 +876,22 @@ def category_match_bases(pid, cat_names):
     return bases
 
 
+def _apply_cat_filter(pid, files, cat_names=None, exc_names=None):
+    """按「包含 / 排除」过滤文件列表。
+
+    cat_names 非空时只保留命中其中任一分类的图（并集）；
+    exc_names 非空时剔除命中其中任一分类的图（并集）。
+    某侧分类名全部无效时 category_match_bases 返回 None，该侧不生效（与原有容错一致）。
+    """
+    inc = category_match_bases(pid, cat_names) if cat_names else None
+    exc = category_match_bases(pid, exc_names) if exc_names else None
+    if inc is not None:
+        files = [f for f in files if _base_name(f) in inc]
+    if exc is not None:
+        files = [f for f in files if _base_name(f) not in exc]
+    return files
+
+
 # ======================================================================
 # 查询逻辑
 # ======================================================================
@@ -817,7 +907,7 @@ def _fmt_ts(epoch):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
 
 
-# annotation 状态缓存：qc_status/reviewed_at 短时间不变，缓存 30s。
+# annotation 状态缓存：qc_status/reviewed_at 短时间不变，缓存 10s。
 # _reconcile_overrides 会对所有本地纠正（pass/reject）逐张拉 annotation，若每次都现查，
 # 累计打回图多时会拖慢列表/计数请求（首屏与提交后卡顿的主因之一）。
 # 键是 (pid, image_id)：6000 图 × 多项目会很大，所以必须"过期即删 + 上限淘汰"。
@@ -841,7 +931,7 @@ def _annotation_cache_get(pid, img):
 def _annotation_cache_put(pid, img, v):
     key = (pid, img)
     with _ANNOTATION_CACHE_LOCK:
-        _ANNOTATION_CACHE[key] = (time.time() + 30, v)
+        _ANNOTATION_CACHE[key] = (time.time() + 10, v)
         _ANNOTATION_CACHE.move_to_end(key)
         while len(_ANNOTATION_CACHE) > _ANNOTATION_CACHE_MAX:
             _ANNOTATION_CACHE.popitem(last=False)
@@ -1056,10 +1146,105 @@ def _image_info_map(pid):
     return info
 
 
-def query_images(pid, cat_names, sort=None, passed_minutes=None):
+# ---------- 缺失子框校验 ----------
+# 规则：父属性框存在时，框内必须至少包含一个指定子属性框；
+# 一个都没有 -> 该父框很可能漏标，把这张图筛出来。
+RULE_MAX_COUNT = 20
+
+
+def _norm_boxes(item):
+    """导出 bbox [x,y,w,h,cls] -> (x1,y1,x2,y2,cls)；负宽高做归一化。"""
+    out = []
+    for b in item.get("bboxes", []):
+        if len(b) < 5:
+            continue
+        try:
+            x, y, w, h, cls = float(b[0]), float(b[1]), float(b[2]), float(b[3]), int(b[4])
+        except (TypeError, ValueError):
+            continue
+        x1, x2 = (x, x + w) if w >= 0 else (x + w, x)
+        y1, y2 = (y, y + h) if h >= 0 else (y + h, y)
+        out.append((x1, y1, x2, y2, cls))
+    return out
+
+
+def _box_inside(child, parent):
+    """完全包含：子框四边都落在父框内（边界重合算包含）。"""
+    return (child[0] >= parent[0] and child[1] >= parent[1]
+            and child[2] <= parent[2] and child[3] <= parent[3])
+
+
+def _compile_rules(proj, rules):
+    """校验并编译缺失校验规则。
+
+    rules: [{"parent": 属性名, "children": [属性名...]}, ...]
+    返回 [(parent_idx, parent_name, child_idxs, child_names)]，idx 是导出用的 1-based 编号。
+    """
+    if not isinstance(rules, list) or not rules:
+        return []
+    if len(rules) > RULE_MAX_COUNT:
+        raise RuntimeError("规则过多（最多 %d 条）" % RULE_MAX_COUNT)
+    compiled = []
+    for i, r in enumerate(rules, 1):
+        if not isinstance(r, dict):
+            raise RuntimeError("规则 %d 格式错误" % i)
+        parent = r.get("parent") or ""
+        children = r.get("children") or []
+        if not parent:
+            raise RuntimeError("规则 %d 缺少父属性" % i)
+        if not isinstance(children, list):
+            raise RuntimeError("规则 %d 的子属性格式错误" % i)
+        children = [c for c in children if c]
+        if not children:
+            raise RuntimeError("规则 %d 缺少子属性" % i)
+        p_idx = category_to_export_idx(proj, parent)
+        if p_idx is None:
+            raise RuntimeError("规则里的属性不存在：" + parent)
+        child_names = []
+        child_idxs = []
+        for c in children:
+            if c == parent:
+                raise RuntimeError("父属性与子属性不能相同：" + parent)
+            ci = category_to_export_idx(proj, c)
+            if ci is None:
+                raise RuntimeError("规则里的属性不存在：" + c)
+            if c not in child_names:
+                child_names.append(c)
+                child_idxs.append(ci)
+        compiled.append((p_idx, parent, child_idxs, child_names))
+    return compiled
+
+
+def _collect_violations(boxes, compiled):
+    """返回违规父框列表：父框存在、但框内一个指定子框都没有。
+
+    boxes: _norm_boxes 归一后的 (x1,y1,x2,y2,cls)
+    """
+    if not compiled:
+        return []
+    by_cat = collections.defaultdict(list)
+    for b in boxes:
+        by_cat[b[4]].append(b)
+    out = []
+    for p_idx, p_name, c_idxs, c_names in compiled:
+        for pb in by_cat.get(p_idx, []):
+            if any(_box_inside(cb, pb)
+                   for ci in c_idxs for cb in by_cat.get(ci, [])):
+                continue
+            out.append({"parent": p_name,
+                        "x": int(round(pb[0])), "y": int(round(pb[1])),
+                        "w": int(round(pb[2] - pb[0])), "h": int(round(pb[3] - pb[1])),
+                        "expected": c_names})
+    return out
+
+
+def query_images(pid, cat_names, sort=None, passed_minutes=None, rules=None):
     """按一个或多个分类名查命中图；cat_names 为空时返回全部图片
     （人工已标注的取自导出，未作业的取自 /images 并记 qc_status="unannotated"）
-    passed_minutes>0 时，只返回该时间窗内新通过、且当前仍为 passed 的图，按通过时间倒序"""
+    passed_minutes>0 时，只返回该时间窗内新通过、且当前仍为 passed 的图，按通过时间倒序
+
+    rules 非空时做缺失子框校验：父属性框存在、但框内没有任何指定子属性框 -> 该图命中。
+    规则与 cat_names 是 AND 关系。图中没有父属性框不算问题，不命中。"""
     proj = get_project(pid)
     if not proj:
         raise RuntimeError("项目不存在：" + pid)
@@ -1068,6 +1253,7 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
         i = category_to_export_idx(proj, c)
         if i is not None:
             idxs.add(i)
+    compiled = _compile_rules(proj, rules or [])
     # 排序/通过时间查询需要最新图列表（刚新分配到质检员的图会出现在导出里），强制刷新导出
     force_export = bool(sort == "reviewed_desc" or passed_minutes)
     _PROGRESS["phase"] = "export"
@@ -1076,6 +1262,9 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
     labels = get_export_labels(pid, force=force_export)
     img_info = _image_info_map(pid)
     owner_map = build_qc_owner_map(pid)
+    assignee_map = build_qc_assignee_map(pid)
+    names = build_uid_name_map()
+    owner_name = _owner_display_name()
     results = []
     seen_bases = set()
     for item in labels.get("labels", []):
@@ -1092,27 +1281,45 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
         else:
             boxes = []
             box_count = len(item.get("bboxes", []))
+        # 缺失子框校验：父框存在但一个子框都没有 -> 记违规；无违规的图不命中
+        violations = _collect_violations(_norm_boxes(item), compiled) if compiled else []
+        if compiled and not violations:
+            continue
         info = img_info.get(_image_id(pic)) or {}
+        uid = assignee_map.get(base, "")
+        ident = _submit_identity(uid, names, owner_name)
         results.append({
             "image_id": _image_id(pic),
             "boxes": boxes,
             "box_count": box_count,
             "qc_status": info.get("qc_status") or "?",
             "qc_owner": owner_map.get(base, ""),
+            "violations": violations,
+            "qc_uid": uid,
+            "submit_as": ident["as"],
+            "submit_by": ident["name"],
+            "submit_note": ident["note"],
         })
         seen_bases.add(base)
-    if not idxs:
+    if not idxs and not compiled:
         # 未作业图：只在「不选标签」时补进来——未作业图没有人工标注，命中不了任何标签
         for iid, info in img_info.items():
             if info["annotated"] or _base_name(iid) in seen_bases:
                 continue
+            base = _base_name(iid)
+            uid = assignee_map.get(base, "")
+            ident = _submit_identity(uid, names, owner_name)
             results.append({
                 "image_id": iid,
                 "boxes": [],
                 "box_count": info["box_count"],
                 "qc_status": "unannotated",
-                "qc_owner": owner_map.get(_base_name(iid), ""),
+                "qc_owner": owner_map.get(base, ""),
                 "pre_annotated": info["pre_annotated"],
+                "qc_uid": uid,
+                "submit_as": ident["as"],
+                "submit_by": ident["name"],
+                "submit_note": ident["note"],
             })
     # 未作业图没有 reviewed_at，也不可能是 passed：排序/时间窗只对有人工标注的行拉实时状态
     annotated_ids = [r["image_id"] for r in results if r["qc_status"] != "unannotated"]
@@ -1143,21 +1350,6 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
     return results
 
 
-def false_pass_images(pid, cat_names):
-    """误通过：已质检通过、但仍带这些（禁止出现的）标签的图
-
-    标签是手填的，写错就必须明确报错——否则空命中会被当成「查全部」，
-    把「所有已通过的图」当成本次核查结果（假阳性）。
-    """
-    proj = get_project(pid)
-    if not proj:
-        raise RuntimeError("项目不存在：" + pid)
-    unknown = [c for c in cat_names if category_to_export_idx(proj, c) is None]
-    if unknown:
-        raise RuntimeError("标签不存在：" + "、".join(unknown) + "（本项目分类：" + "、".join(proj.get("categories") or []) + "）")
-    return [r for r in query_images(pid, cat_names) if r["qc_status"] == "passed"]
-
-
 def distribution(pid):
     proj = get_project(pid)
     if not proj:
@@ -1175,21 +1367,30 @@ def distribution(pid):
 
 
 def search_images(pid, q):
-    """按文件名子串搜索图片（含 qc_status / box_count / 质检员）"""
+    """按文件名子串搜索图片（含 qc_status / box_count / 质检员 / 提交身份）"""
     ql = (q or "").lower()
     imgs = get_images(pid)
     owner_map = build_qc_owner_map(pid)
+    assignee_map = build_qc_assignee_map(pid)
+    names = build_uid_name_map()
+    owner_name = _owner_display_name()
     results = []
     for im in imgs.get("images", []):
         iid = im.get("image_id", "")
         if ql in iid.lower():
             base = os.path.splitext(os.path.basename(iid))[0]
+            uid = assignee_map.get(base, "")
+            ident = _submit_identity(uid, names, owner_name)
             results.append({
                 "image_id": iid,
                 "qc_status": im.get("qc_status"),
                 "box_count": im.get("box_count"),
                 "annotated": im.get("annotated"),
                 "qc_owner": owner_map.get(base, ""),
+                "qc_uid": uid,
+                "submit_as": ident["as"],
+                "submit_by": ident["name"],
+                "submit_note": ident["note"],
             })
     return results
 
@@ -1289,7 +1490,7 @@ def _qc_status_resolver(pid, uid, force=False, _retry=True):
             pass
         return _qc_status_resolver(pid, uid, force=False, _retry=False)
     overrides = get_overrides(pid, uid)
-    save_pending = _SAVE_PENDING.get(pid) or set()
+    save_pending = _SAVE_PENDING.get((pid, uid)) or set()
 
     def resolve(f):
         if f in overrides:
@@ -1324,20 +1525,25 @@ def qc_counts(pid, uid, force=False):
     return _qc_counts_of(files, resolve), snapshot_missing
 
 
-def qc_recent(pid, uid, force=False):
-    """返回该质检员最近提交的照片（按提交顺序，最新在前，最多 3 组=12 张）+ 实时计数"""
+def qc_recent(pid, uid, force=False, cat_names=None, exc_names=None):
+    """返回该质检员最近提交的照片（按提交顺序，最新在前，最多 3 组=12 张）+ 实时计数。
+
+    cat_names/exc_names 与 assigned 同一套语义：先并集包含、再剔除排除。
+    """
     out = []
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid and g.get("uid") == uid:
             out.extend(g.get("image_ids") or [])
     files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
+    out = _apply_cat_filter(pid, out, cat_names, exc_names)
+    files = _apply_cat_filter(pid, files, cat_names, exc_names)
     items = out[:12]
     box_counts = {f: box_map.get(f, 0) for f in items}
     return {"items": items, "box_counts": box_counts,
             "counts": _qc_counts_of(files, resolve), "snapshot_missing": snapshot_missing}
 
 
-def qc_save(pid, image_id, boxes):
+def qc_save(pid, image_id, boxes, uid=""):
     """保存某张图的标注框（整体替换）。返回 {ok, box_count} 或 {ok, error}
     用 owner（管理员）token 保存：质检员本人无「保存标注」权限，需以管理员身份落框。"""
     s, h, raw = upstream("POST", "/api/projects/%s/save" % pid,
@@ -1354,25 +1560,77 @@ def qc_save(pid, image_id, boxes):
         for g in _RECENT_GROUPS:
             if g.get("pid") == pid:
                 (g.get("verdicts") or {}).pop(image_id, None)
-        # 记录「保存后应为 pending」的纠正，弥补 /images 快照滞后
-        _SAVE_PENDING.setdefault(pid, set()).add(image_id)
+        # 记录「保存后应为 pending」的纠正，弥补 /images 快照滞后。
+        # 必须按 (项目, 账号) 隔离：同一台机器退出作业员再登录质检员时，
+        # 作业员保存过的图不能把质检员的「已通过」强行改成「未质检」。
+        _SAVE_PENDING.setdefault((pid, uid or ""), set()).add(image_id)
         # 该图在复核缓存里立刻失效（就地摘掉，不清整块，避免下一次列表请求打全量复核）
         note_overrides_saved(pid, image_id)
         return {"ok": True, "box_count": d.get("box_count", len(boxes))}
     return {"ok": False, "error": d.get("error") or ("HTTP %s" % s)}
 
 
-def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
-    """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names 非空时按属性过滤。
+def overlap_images(pid):
+    """返回项目内存在「几乎重合框」的图片 id（带 .jpg）。
+
+    基于全量导出缓存（像素坐标）一次性扫描，避免逐张调用 /annotation。
+    判定用 IoU（交并比）>= OVERLAP_IOU，与前端画布提示的规则完全一致。
+    同一项目最多每 60 秒强制刷新一次导出，避免不同人扫描时间不同导致结果长期不一致。
+    """
+    if not get_project(pid):
+        raise RuntimeError("项目不存在：" + pid)
+    now = time.time()
+    with _OVERLAP_EXPORT_LOCK:
+        force = now - _OVERLAP_EXPORT_TS.get(pid, 0.0) >= OVERLAP_EXPORT_FORCE_GAP
+        if force:
+            _OVERLAP_EXPORT_TS[pid] = now
+    data = get_export_labels(pid, force=force)
+    out = []
+    for item in data.get("labels", []):
+        pic = item.get("pic_id") or ""
+        boxes = item.get("bboxes") or []
+        if not pic or len(boxes) < 2:
+            continue
+        rects = []
+        for b in boxes:
+            if not b or len(b) < 4:
+                continue
+            x, y, w, h = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            if w <= 0 or h <= 0:
+                continue
+            rects.append((x, y, x + w, y + h))
+        hit = False
+        for i in range(len(rects)):
+            ax1, ay1, ax2, ay2 = rects[i]
+            area_a = (ax2 - ax1) * (ay2 - ay1)
+            for j in range(i + 1, len(rects)):
+                bx1, by1, bx2, by2 = rects[j]
+                area_b = (bx2 - bx1) * (by2 - by1)
+                iw = min(ax2, bx2) - max(ax1, bx1)
+                ih = min(ay2, by2) - max(ay1, by1)
+                if iw <= 0 or ih <= 0:
+                    continue
+                inter = iw * ih
+                union = area_a + area_b - inter
+                if union > 0 and inter / union >= OVERLAP_IOU:
+                    hit = True
+                    break
+            if hit:
+                break
+        if hit:
+            out.append(_image_id(pic))
+    return out
+
+
+def qc_assigned(pid, uid, status, offset, limit, cat_names=None, exc_names=None, force=False):
+    """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names/exc_names 非空时按属性过滤。
 
     同时返回 counts（与 items 同一快照、同一过滤范围），供前端一次请求同时渲染徽标与列表。
     snapshot_missing：名下有分配、但 /images 快照里完全没有的图数 —— 快照缺图时前端据此
     解释「小圈有数字、列表空」，而不是干瞪着纯黑。
     """
     files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
-    cat_bases = category_match_bases(pid, cat_names) if cat_names else None
-    if cat_bases is not None:
-        files = [f for f in files if _base_name(f) in cat_bases]
+    files = _apply_cat_filter(pid, files, cat_names, exc_names)
     counts = _qc_counts_of(files, resolve)
     matched = [f for f in files if resolve(f) == status]
     total = len(matched)
@@ -1525,7 +1783,7 @@ def _anno_status_resolver(pid, uid, force=False):
         if iid:
             info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status"),
                          "box_count": im.get("box_count") or 0}
-    save_pending = _SAVE_PENDING.get(pid) or set()
+    save_pending = _SAVE_PENDING.get((pid, uid)) or set()
     rejected_bases = anno_rejected_bases(pid)
 
     def bucket(f):
@@ -1576,6 +1834,120 @@ def anno_counts(pid, uid, force=False):
     """返回某作业员的数量：总数 / 未作业 / 已提交 / 被打回"""
     files, bucket, _ = _anno_status_resolver(pid, uid, force)
     return _anno_counts_of(files, bucket)
+
+
+# ======================================================================
+# 在线人数（云端注册表优先，局域网 UDP 兜底）
+# ======================================================================
+def _presence_beacon():
+    """每 5 秒向两套构建的端口广播一次心跳；失败静默（防火墙/无网卡都不影响主流程）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    payload = json_bytes({
+        "app": "label-auto",
+        "id": _PRESENCE_ID,
+        "host": _PRESENCE_HOST_HASH,   # 只发哈希，不外泄主机名
+        "role": "staff" if RELEASE_MODE else "admin",
+        "ver": VERSION,
+    })
+    while True:
+        for port in PRESENCE_PORTS:
+            try:
+                s.sendto(payload, ("255.255.255.255", port))
+            except Exception:
+                pass
+        time.sleep(PRESENCE_INTERVAL)
+
+
+def _presence_listener():
+    """接收局域网内其他实例的心跳。
+
+    端口绑定失败（被占用/无权限）时关闭统计：前端不显示，避免误报「在线 1 人」。
+    """
+    global _PRESENCE_ENABLED
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", PRESENCE_LISTEN_PORT))
+        s.settimeout(2.0)
+    except Exception:
+        _PRESENCE_ENABLED = False
+        try:
+            s.close()
+        except Exception:
+            pass
+        return
+    while True:
+        try:
+            data, _addr = s.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except Exception:
+            time.sleep(1)
+            continue
+        try:
+            d = json.loads(data.decode("utf-8"))
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("app") != "label-auto":
+            continue
+        iid = str(d.get("id") or "")
+        host = str(d.get("host") or "")
+        if not iid or not host:
+            continue
+        with _PRESENCE_LOCK:
+            _PRESENCE[iid] = {"host": host, "role": d.get("role") or "", "ts": time.time()}
+
+
+def _online_beat():
+    """每 15 秒向云端注册表上报心跳，成功则缓存返回的在线数。
+
+    失败静默：保留上次成功结果，超过 ONLINE_TTL 后由 online_count() 自动回退局域网。
+    """
+    body = json.dumps({
+        "id": _PRESENCE_ID,
+        "host": _PRESENCE_HOST_HASH,
+        "role": "staff" if RELEASE_MODE else "admin",
+        "ver": VERSION,
+    }, ensure_ascii=False).encode("utf-8")
+    url = ONLINE_REGISTRY.rstrip("/") + "/presence/heartbeat"
+    while True:
+        try:
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Content-Type": "application/json",
+                "X-App-Token": ONLINE_TOKEN,
+                "User-Agent": "label-auto-presence",
+            })
+            with urllib.request.urlopen(req, timeout=3) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            if isinstance(d, dict) and d.get("ok"):
+                with _ONLINE_LOCK:
+                    _ONLINE.update({"count": int(d.get("count") or 0),
+                                    "ts": time.time(), "ok": True})
+        except Exception:
+            pass
+        time.sleep(ONLINE_INTERVAL)
+
+
+def online_count():
+    """同时在线机器数：云端注册表优先（40 秒内有效），否则回退局域网广播。"""
+    with _ONLINE_LOCK:
+        cloud = dict(_ONLINE)
+    if cloud["ok"] and time.time() - cloud["ts"] <= ONLINE_TTL:
+        return {"ok": True, "enabled": True,
+                "count": max(int(cloud["count"]), 1), "source": "cloud"}
+    if not _PRESENCE_ENABLED:
+        return {"ok": True, "enabled": False, "count": 0, "source": "none"}
+    now = time.time()
+    with _PRESENCE_LOCK:
+        for k in [k for k, v in _PRESENCE.items() if now - v["ts"] > PRESENCE_TIMEOUT]:
+            _PRESENCE.pop(k, None)
+        hosts = {v["host"] for v in _PRESENCE.values()}
+    hosts.add(_PRESENCE_HOST_HASH)
+    return {"ok": True, "enabled": True, "count": len(hosts), "source": "lan"}
 
 
 # ======================================================================
@@ -1741,6 +2113,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _USER_CREDENTIALS.pop(uid, None)
             TOKEN = None
             USER = None
+            _reset_session_state()
             clear_cache_all()
             return self._send_json({"ok": True})
 
@@ -1749,6 +2122,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/config" and method == "GET":
             return self._send_json({"ok": True, "release": RELEASE_MODE})
+
+        # 同时在线人数（只暴露一个数字，和 /api/config 一样不加门槛）
+        if path == "/api/online" and method == "GET":
+            return self._send_json(online_count())
 
         # ---- 版本 / 更新（照片区右下角的版本号 + 更新按钮用） ----
         # 只回版本号，无敏感信息，所以和 /api/config 一样不加门槛。
@@ -1900,6 +2277,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status = qs.get("status", ["pending"])[0]
             cat = qs.get("cat", [""])[0]
             cat_names = [c for c in cat.split(",") if c] if cat else None
+            exc = qs.get("exc", [""])[0]
+            exc_names = [c for c in exc.split(",") if c] if exc else None
             try:
                 offset = int(qs.get("offset", ["0"])[0] or 0)
                 limit = int(qs.get("limit", ["20"])[0] or 20)
@@ -1909,8 +2288,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, **qc_assigned(pid, uid, status, offset, limit, cat_names,
+                return self._send_json({"ok": True, **qc_assigned(pid, uid, status, offset, limit,
+                                                                 cat_names, exc_names,
                                                                  force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        if path == "/api/qc/overlap" and method == "GET":
+            pid = qs.get("pid", [""])[0]
+            uid = qs.get("uid", [""])[0]
+            gate = self._qc_gated(uid)
+            if gate:
+                return gate
+            try:
+                return self._send_json({"ok": True, "ids": overlap_images(pid)})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1932,11 +2323,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if m and method == "GET":
             pid = qs.get("pid", [""])[0]
             uid = qs.get("uid", [""])[0]
+            cat = qs.get("cat", [""])[0]
+            cat_names = [c for c in cat.split(",") if c] if cat else None
+            exc = qs.get("exc", [""])[0]
+            exc_names = [c for c in exc.split(",") if c] if exc else None
             gate = self._qc_gated(uid)
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, **qc_recent(pid, uid, force=_is_force(qs))})
+                return self._send_json({"ok": True, **qc_recent(pid, uid, force=_is_force(qs),
+                                                               cat_names=cat_names,
+                                                               exc_names=exc_names)})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1967,9 +2364,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pid = body.get("pid") or ""
             iid = body.get("image_id") or ""
             boxes = body.get("boxes")
+            uid = body.get("uid") or ""
             if not pid or not iid or not isinstance(boxes, list):
                 return self._send_json({"ok": False, "error": "参数非法"}, 400)
-            r = qc_save(pid, iid, boxes)
+            r = qc_save(pid, iid, boxes, uid)
             return self._send_json(r, 200 if r.get("ok") else 400)
 
         # /api/projects/{id}/images
@@ -1999,7 +2397,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(s, self._pick_headers(h), raw)
 
         if not RELEASE_MODE:
-            # /api/projects/{id}/query?cat=a,b&sort=reviewed_desc
+            # /api/projects/{id}/query?cat=a,b&rules=<JSON>&sort=reviewed_desc
             m = re.match(r"^/api/projects/([^/]+)/query$", path)
             if m and method == "GET":
                 cats = [c for c in (qs.get("cat", [""])[0]).split(",") if c] if qs.get("cat") else []
@@ -2009,17 +2407,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     passed_minutes = int(pm_raw) if pm_raw else 0
                 except ValueError:
                     passed_minutes = 0
+                rules = None
+                rules_raw = qs.get("rules", [""])[0]
+                if rules_raw:
+                    try:
+                        body = json.loads(rules_raw)
+                    except Exception:
+                        body = None
+                    if not isinstance(body, dict) or not isinstance(body.get("rules"), list):
+                        return self._send_json({"ok": False, "error": "筛选规则格式错误"}, 400)
+                    rules = body["rules"]
                 try:
-                    return self._send_json({"ok": True, "results": query_images(m.group(1), cats, sort, passed_minutes)})
-                except RuntimeError as e:
-                    return self._send_json({"ok": False, "error": str(e)}, 400)
-
-            # /api/projects/{id}/false_pass?cats=a,b
-            m = re.match(r"^/api/projects/([^/]+)/false_pass$", path)
-            if m and method == "GET":
-                cats = [c for c in (qs.get("cats", [""])[0]).split(",") if c] if qs.get("cats") else []
-                try:
-                    return self._send_json({"ok": True, "results": false_pass_images(m.group(1), cats)})
+                    return self._send_json({"ok": True,
+                                            "results": query_images(m.group(1), cats, sort, passed_minutes, rules)})
                 except RuntimeError as e:
                     return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -2047,11 +2447,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if m and method == "GET":
                 return self._send_json({"ok": True})
 
-            # /api/export/{id}?mode=passed|full|yolo
-            m = re.match(r"^/api/export/([^/]+)$", path)
-            if m and method == "GET":
-                return self._export(m.group(1), qs.get("mode", ["full"])[0])
-
             # /api/projects/{id}/batch_qc  (POST)
             m = re.match(r"^/api/projects/([^/]+)/batch_qc$", path)
             if m and method == "POST":
@@ -2073,6 +2468,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if s == 200:
             global TOKEN, USER
             data = json.loads(raw2.decode("utf-8"))
+            # 换账号：先把上一个账号的本地纠正/最近提交/凭据清掉，再写入新账号
+            _reset_session_state()
+            clear_cache_all()
             TOKEN = data.get("token")
             USER = data.get("user")
             # 按 uid 记账：图片/标注转发按 uid 取本人 token；
@@ -2229,7 +2627,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
             _RECENT_GROUPS[:] = _RECENT_GROUPS[:100]
             # 已提交 verdict，保存时的 pending 纠正不再需要
-            sp = _SAVE_PENDING.get(pid)
+            sp = _SAVE_PENDING.get((pid, uid))
             if sp:
                 for v in verdicts:
                     sp.discard(v.get("image_id"))
@@ -2300,18 +2698,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "succeeded": succeeded,
             "failed": failed,
         })
-
-    # ---- 导出下载 ----
-    def _export(self, pid, mode):
-        query = {"format": "json"}
-        if mode == "passed":
-            query["only"] = "passed"
-        elif mode == "yolo":
-            query["format"] = "yolo"
-        s, h, raw = upstream("GET", "/api/projects/%s/export" % pid, query=query)
-        cd = h.get("Content-Disposition") or ('attachment; filename="%s_%s.zip"' % (pid, mode))
-        return self._send(s, {"Content-Type": h.get("Content-Type", "application/zip"),
-                              "Content-Disposition": cd}, raw)
 
     # ---- 静态文件 ----
     def _serve_static(self, path):
@@ -2905,6 +3291,10 @@ def main():
         return
     _cleanup_update_leftovers()
     _maybe_show_updated_notice()
+    # 在线人数：云端注册表心跳（主）+ 局域网广播（兜底）
+    threading.Thread(target=_online_beat, daemon=True).start()
+    threading.Thread(target=_presence_beacon, daemon=True).start()
+    threading.Thread(target=_presence_listener, daemon=True).start()
     httpd = None
     port = PORT_START
     for p in range(PORT_START, PORT_START + 30):
